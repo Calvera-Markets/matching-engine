@@ -1,0 +1,8 @@
+[package]
+name = "matching-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+calvera-books = { workspace = true }
+libc = "0.2"
