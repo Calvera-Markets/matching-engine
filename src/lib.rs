@@ -1,3 +1,4 @@
+pub mod egress;
 pub mod engine;
 pub mod ingress;
 pub mod itch;
