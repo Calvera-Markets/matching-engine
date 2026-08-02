@@ -6,3 +6,15 @@ edition = "2024"
 [dependencies]
 calvera-books = { workspace = true }
 libc = "0.2"
+
+[dev-dependencies]
+criterion = "0.8.2"
+dbn = "0.66"
+
+[[bench]]
+name = "hot"
+harness = false
+
+[[example]]
+name = "tape_replay"
+path = "examples/tape_replay.rs"
