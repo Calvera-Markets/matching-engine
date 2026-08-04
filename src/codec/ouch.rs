@@ -2,7 +2,11 @@
 
 use calvera_books::{Price, Side};
 
+use crate::codec::{OrderEntry, ParseOutcome, SessionId};
 use crate::types::{Command, CommandType, Event, EventType};
+
+/// Stateless OUCH order-entry codec.
+pub struct Ouch;
 
 pub const ENTER: u8 = b'O';
 pub const CANCEL: u8 = b'X';
@@ -162,4 +166,18 @@ fn write_executed(evt: &Event, out: &mut [u8]) -> usize {
     out[17..25].copy_from_slice(&evt.trade.price.0.to_be_bytes());
     out[26..34].copy_from_slice(&evt.trade.match_number.to_be_bytes());
     N
+}
+
+impl OrderEntry for Ouch {
+    fn parse(&mut self, buf: &[u8], session: SessionId, _reply: &mut [u8]) -> ParseOutcome {
+        match parse(buf, session.0) {
+            Some((cmd, consumed)) => ParseOutcome::Command { cmd, consumed },
+            None if buf.len() < MAX_MSG => ParseOutcome::NeedMore,
+            None => ParseOutcome::Bad { consumed: 1 },
+        }
+    }
+
+    fn encode_event(&mut self, evt: &Event, out: &mut [u8]) -> usize {
+        serialize(evt, out)
+    }
 }

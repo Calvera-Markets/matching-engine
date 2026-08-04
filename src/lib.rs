@@ -4,13 +4,13 @@ pub mod codec;
 pub mod egress;
 pub mod engine;
 pub mod ingress;
-pub mod itch;
 pub mod itch_pub;
-pub mod ouch;
 pub mod spsc;
 pub mod types;
 pub mod wal;
 
+pub use codec::itch;
+pub use codec::ouch;
 pub use engine::MatchingEngine;
 pub use spsc::Spsc;
 pub use types::{Command, CommandType, Event, EventType};

@@ -2,6 +2,7 @@
 
 use calvera_books::Side;
 
+use crate::codec::MarketData;
 use crate::types::{Event, EventType};
 
 const LOCATE: u16 = 0x0100;
@@ -66,6 +67,16 @@ impl Packet {
         self.off = size_of::<MoldHeader>();
         self.count = 0;
         Some(&self.buf[..n])
+    }
+}
+
+impl MarketData for Packet {
+    fn push(&mut self, evt: &Event) -> bool {
+        Packet::push(self, evt)
+    }
+
+    fn take(&mut self) -> Option<&[u8]> {
+        Packet::take(self)
     }
 }
 

@@ -1,4 +1,8 @@
-//! Wire codecs (maps bytes to `Command`/`Event`)
+//! Wire codecs (maps bytes to `Command`/`Event`).
+
+pub mod itch;
+pub mod ouch;
+
 use std::time::Instant;
 
 use crate::types::{Command, Event};
