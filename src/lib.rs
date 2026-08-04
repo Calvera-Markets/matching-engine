@@ -1,8 +1,6 @@
 //! Matching engine shell around `calvera-books`.
-//!
-//! Same pipeline as `crates/ordertruques/orderbook`: four threads, three SPSC
-//! rings, WAL-before-apply. See `docs/matching-engine.md`.
 
+pub mod codec;
 pub mod egress;
 pub mod engine;
 pub mod ingress;
