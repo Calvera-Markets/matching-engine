@@ -1,17 +1,19 @@
-//! One thread: accept TCP, parse OUCH, push Commands. Sole producer on cmdQueue.
+//! One thread: accept TCP, parse order entry, push Commands. Sole producer on cmdQueue.
 
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::ouch::{self, MAX_MSG};
+use crate::codec::{OrderEntry, ParseOutcome, SessionId};
 use crate::spsc::Spsc;
 use crate::types::Command;
 
 const READ_BUF: usize = 4096;
+const REPLY_BUF: usize = 1024;
 
 struct Client {
     stream: TcpStream,
@@ -19,20 +21,22 @@ struct Client {
     len: usize,
 }
 
-pub struct Ingress {
+pub struct Ingress<Oe> {
     listener: TcpListener,
     clients: HashMap<i32, Client>,
     cmds: Arc<Spsc<Command>>,
+    oe: Oe,
 }
 
-impl Ingress {
-    pub fn bind(port: u16, cmds: Arc<Spsc<Command>>) -> io::Result<Self> {
+impl<Oe: OrderEntry> Ingress<Oe> {
+    pub fn bind(port: u16, cmds: Arc<Spsc<Command>>, oe: Oe) -> io::Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port))?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,
             clients: HashMap::new(),
             cmds,
+            oe,
         })
     }
 
@@ -68,6 +72,8 @@ impl Ingress {
     fn read_all(&mut self) {
         let mut dead = Vec::new();
         let fds: Vec<i32> = self.clients.keys().copied().collect();
+        let mut reply = [0u8; REPLY_BUF];
+        let now = Instant::now();
         for fd in fds {
             let Some(client) = self.clients.get_mut(&fd) else {
                 continue;
@@ -78,16 +84,24 @@ impl Ingress {
                     client.len += n;
                     let mut off = 0;
                     while off < client.len {
-                        match ouch::parse(&client.buf[off..client.len], fd) {
-                            Some((cmd, used)) => {
+                        match self.oe.parse(
+                            &client.buf[off..client.len],
+                            SessionId(fd),
+                            &mut reply,
+                        ) {
+                            ParseOutcome::Command { cmd, consumed } => {
                                 self.cmds.push(cmd);
-                                off += used;
+                                off += consumed.max(1);
                             }
-                            None => {
-                                if client.len - off < MAX_MSG {
-                                    break;
+                            ParseOutcome::Reply { bytes, consumed } => {
+                                if bytes > 0 {
+                                    let _ = client.stream.write_all(&reply[..bytes]);
                                 }
-                                off += 1;
+                                off += consumed.max(1);
+                            }
+                            ParseOutcome::NeedMore => break,
+                            ParseOutcome::Bad { consumed } => {
+                                off += consumed.max(1);
                             }
                         }
                     }
@@ -96,11 +110,17 @@ impl Ingress {
                         client.len -= off;
                     }
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    let n = self.oe.on_idle(now, &mut reply);
+                    if n > 0 {
+                        let _ = client.stream.write_all(&reply[..n]);
+                    }
+                }
                 Err(_) => dead.push(fd),
             }
         }
         for fd in dead {
+            self.oe.on_session_end(SessionId(fd));
             self.clients.remove(&fd);
         }
     }

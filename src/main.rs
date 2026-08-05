@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use matching_engine::codec::ouch::Ouch;
 use matching_engine::egress::Egress;
 use matching_engine::engine::MatchingEngine;
 use matching_engine::ingress::Ingress;
@@ -100,7 +101,7 @@ fn main() {
                 std::process::exit(1);
             });
 
-    let mut ingress = Ingress::bind(cfg.port, cmds.clone()).unwrap_or_else(|e| {
+    let mut ingress = Ingress::bind(cfg.port, cmds.clone(), Ouch).unwrap_or_else(|e| {
         eprintln!("bind :{}: {e}", cfg.port);
         std::process::exit(1);
     });
