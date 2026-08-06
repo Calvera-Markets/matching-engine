@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use matching_engine::codec::itch::Packet;
 use matching_engine::codec::ouch::Ouch;
 use matching_engine::egress::Egress;
 use matching_engine::engine::MatchingEngine;
 use matching_engine::ingress::Ingress;
-use matching_engine::itch_pub::ItchPub;
+use matching_engine::md_pub::MdPub;
 use matching_engine::types::{Command, Event};
 use matching_engine::{Spsc, lock_memory, pin_to_cpu};
 
@@ -106,11 +107,17 @@ fn main() {
         std::process::exit(1);
     });
     let mut egress = Egress::new(ouch, Ouch);
-    let mut itch_pub = ItchPub::new(itch, cfg.itch_ip, cfg.itch_port, cfg.itch_iface)
-        .unwrap_or_else(|e| {
-            eprintln!("itch socket: {e}");
-            std::process::exit(1);
-        });
+    let mut itch_pub = MdPub::new(
+        itch,
+        cfg.itch_ip,
+        cfg.itch_port,
+        cfg.itch_iface,
+        Packet::new(),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("itch socket: {e}");
+        std::process::exit(1);
+    });
 
     lock_memory();
 

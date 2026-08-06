@@ -1,26 +1,27 @@
-//! Public ITCH/MoldUDP multicast. Sole consumer of the ITCH event ring.
+//! Public market-data multicast. Sole consumer of the public event ring.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::itch::Packet;
+use crate::codec::MarketData;
 use crate::spsc::Spsc;
 use crate::types::Event;
 
-pub struct ItchPub {
+pub struct MdPub<Md> {
     events: Arc<Spsc<Event>>,
     sock: UdpSocket,
     dest: SocketAddrV4,
-    packet: Packet,
+    md: Md,
 }
 
-impl ItchPub {
+impl<Md: MarketData> MdPub<Md> {
     pub fn new(
         events: Arc<Spsc<Event>>,
         group: Ipv4Addr,
         port: u16,
         iface: Ipv4Addr,
+        md: Md,
     ) -> std::io::Result<Self> {
         let sock = UdpSocket::bind((iface, 0))?;
         sock.set_nonblocking(true)?;
@@ -29,7 +30,7 @@ impl ItchPub {
             events,
             sock,
             dest: SocketAddrV4::new(group, port),
-            packet: Packet::new(),
+            md,
         })
     }
 
@@ -41,9 +42,9 @@ impl ItchPub {
                     crate::pause();
                 }
                 Some(evt) => {
-                    if !self.packet.push(&evt) {
+                    if !self.md.push(&evt) {
                         self.flush();
-                        let _ = self.packet.push(&evt);
+                        let _ = self.md.push(&evt);
                     }
                 }
             }
@@ -52,7 +53,7 @@ impl ItchPub {
     }
 
     fn flush(&mut self) {
-        if let Some(bytes) = self.packet.take() {
+        if let Some(bytes) = self.md.take() {
             let _ = self.sock.send_to(bytes, self.dest);
         }
     }

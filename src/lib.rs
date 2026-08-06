@@ -4,7 +4,7 @@ pub mod codec;
 pub mod egress;
 pub mod engine;
 pub mod ingress;
-pub mod itch_pub;
+pub mod md_pub;
 pub mod spsc;
 pub mod types;
 pub mod wal;
