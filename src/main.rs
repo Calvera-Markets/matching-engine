@@ -105,7 +105,7 @@ fn main() {
         eprintln!("bind :{}: {e}", cfg.port);
         std::process::exit(1);
     });
-    let mut egress = Egress::new(ouch);
+    let mut egress = Egress::new(ouch, Ouch);
     let mut itch_pub = ItchPub::new(itch, cfg.itch_ip, cfg.itch_port, cfg.itch_iface)
         .unwrap_or_else(|e| {
             eprintln!("itch socket: {e}");
