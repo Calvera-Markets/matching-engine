@@ -90,4 +90,66 @@ mod tests {
 
         let _ = std::fs::remove_file(dir);
     }
+
+    #[test]
+    fn fill_acks_maker_and_taker_once_on_tape() {
+        let dir = std::env::temp_dir().join(format!("me-wal-{}-fill.wal", std::process::id()));
+        let cmds = Arc::new(Spsc::new(16));
+        let ouch = Arc::new(Spsc::new(16));
+        let itch = Arc::new(Spsc::new(16));
+        let mut eng = MatchingEngine::with_wal_size(
+            cmds.clone(),
+            ouch.clone(),
+            itch.clone(),
+            &dir,
+            1024,
+            64 * 1024,
+        )
+        .unwrap();
+
+        let mut bid = Command::blank(CommandType::Add);
+        bid.side = calvera_books::Side::Bid;
+        bid.price = calvera_books::Price(100);
+        bid.quantity = 10;
+        bid.client_fd = 7;
+        bid.user_ref = 1;
+        let mut ask = Command::blank(CommandType::Add);
+        ask.side = calvera_books::Side::Ask;
+        ask.price = calvera_books::Price(100);
+        ask.quantity = 10;
+        ask.client_fd = 8;
+        ask.user_ref = 2;
+
+        cmds.push(bid);
+        cmds.push(ask);
+        cmds.push(Command::poison());
+        eng.run(&std::sync::atomic::AtomicBool::new(true));
+
+        let mut private = Vec::new();
+        while let Some(ev) = ouch.pop() {
+            private.push(ev);
+        }
+        let mut public = Vec::new();
+        while let Some(ev) = itch.pop() {
+            public.push(ev);
+        }
+
+        let private_trades: Vec<_> = private
+            .iter()
+            .filter(|e| e.ty == EventType::TradeExecuted)
+            .collect();
+        assert_eq!(private_trades.len(), 2);
+        let mut fds: Vec<i32> = private_trades.iter().map(|e| e.client_fd).collect();
+        fds.sort();
+        assert_eq!(fds, [7, 8]);
+
+        let public_trades: Vec<_> = public
+            .iter()
+            .filter(|e| e.ty == EventType::TradeExecuted)
+            .collect();
+        assert_eq!(public_trades.len(), 1);
+        assert_eq!(public_trades[0].trade.quantity, 10);
+
+        let _ = std::fs::remove_file(dir);
+    }
 }

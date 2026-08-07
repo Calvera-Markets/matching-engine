@@ -193,6 +193,7 @@ impl MatchingEngine {
                     let px = maker.price;
                     let uref = maker.user_ref;
                     let hid = maker.handle.as_u64();
+                    let maker_fd = maker.client_fd;
                     maker.qty = maker.qty.saturating_sub(fill.quantity);
                     let dead = maker.qty == 0;
                     if dead {
@@ -201,8 +202,9 @@ impl MatchingEngine {
                     }
                     let match_no = self.next_match;
                     self.next_match += 1;
-                    self.emit(Event::trade(
+                    self.emit_fill(
                         taker.client_fd,
+                        maker_fd,
                         EventTrade {
                             match_number: match_no,
                             maker_exchange_id: hid,
@@ -211,13 +213,14 @@ impl MatchingEngine {
                             quantity: fill.quantity,
                             taker_side: taker.side,
                         },
-                    ));
+                    );
                     continue;
                 }
             }
             let match_no = self.next_match;
             self.next_match += 1;
-            self.emit(Event::trade(
+            self.emit_fill(
+                taker.client_fd,
                 taker.client_fd,
                 EventTrade {
                     match_number: match_no,
@@ -227,7 +230,7 @@ impl MatchingEngine {
                     quantity: fill.quantity,
                     taker_side: taker.side,
                 },
-            ));
+            );
         }
         filled
     }
@@ -287,6 +290,19 @@ impl MatchingEngine {
                 self.ouch.push(evt);
                 self.itch.push(evt);
             }
+        }
+    }
+
+    /// Private acks go to both counterparties; the public tape gets one print.
+    fn emit_fill(&mut self, taker_fd: i32, maker_fd: i32, trade: EventTrade) {
+        if !self.publish {
+            return;
+        }
+        let tape = Event::trade(taker_fd, trade);
+        self.ouch.push(tape);
+        self.itch.push(tape);
+        if maker_fd != taker_fd {
+            self.ouch.push(Event::trade(maker_fd, trade));
         }
     }
 }
