@@ -7,12 +7,15 @@ edition = "2024"
 default = ["ouch", "itch"]
 ouch = []
 itch = []
-fix = []
+fix = ["dep:ironfix-core", "dep:ironfix-tagvalue", "dep:ironfix-session"]
 sbe = []
 
 [dependencies]
 calvera-books = { workspace = true }
 libc = "0.2"
+ironfix-core = { version = "0.4", optional = true }
+ironfix-tagvalue = { version = "0.4", optional = true }
+ironfix-session = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = "0.8.2"

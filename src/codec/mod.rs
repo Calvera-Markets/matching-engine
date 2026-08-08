@@ -1,5 +1,7 @@
 //! Wire codecs (maps bytes to `Command`/`Event`).
 
+#[cfg(feature = "fix")]
+pub mod fix;
 #[cfg(feature = "itch")]
 pub mod itch;
 #[cfg(feature = "ouch")]
