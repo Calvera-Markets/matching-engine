@@ -3,6 +3,13 @@ name = "matching-engine"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["ouch", "itch"]
+ouch = []
+itch = []
+fix = []
+sbe = []
+
 [dependencies]
 calvera-books = { workspace = true }
 libc = "0.2"
@@ -10,6 +17,11 @@ libc = "0.2"
 [dev-dependencies]
 criterion = "0.8.2"
 dbn = "0.66"
+
+[[bin]]
+name = "matching-engine"
+path = "src/main.rs"
+required-features = ["ouch", "itch"]
 
 [[bench]]
 name = "hot"

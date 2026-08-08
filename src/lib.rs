@@ -9,7 +9,9 @@ pub mod spsc;
 pub mod types;
 pub mod wal;
 
+#[cfg(feature = "itch")]
 pub use codec::itch;
+#[cfg(feature = "ouch")]
 pub use codec::ouch;
 pub use engine::MatchingEngine;
 pub use spsc::Spsc;

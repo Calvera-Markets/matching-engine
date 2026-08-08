@@ -1,6 +1,8 @@
 //! Wire codecs (maps bytes to `Command`/`Event`).
 
+#[cfg(feature = "itch")]
 pub mod itch;
+#[cfg(feature = "ouch")]
 pub mod ouch;
 
 use std::time::Instant;
