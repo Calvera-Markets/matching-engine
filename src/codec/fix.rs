@@ -7,8 +7,10 @@ use ironfix_core::error::DecodeError;
 use ironfix_core::message::{MsgType, RawMessage};
 use ironfix_tagvalue::{Decoder, Encoder};
 
+use calvera_books::{Price, Side};
+
 use crate::codec::{OrderEntry, ParseOutcome, SessionId};
-use crate::types::Event;
+use crate::types::{Command, CommandType, Event};
 
 const BEGIN: &str = "FIX.4.4";
 const TAG_SENDER: u32 = 49;
@@ -19,11 +21,19 @@ const TAG_TEST_REQ: u32 = 112;
 const TAG_REF_SEQ: u32 = 45;
 const TAG_TEXT: u32 = 58;
 const TAG_ENCRYPT: u32 = 98;
+const TAG_CLORD: u32 = 11;
+const TAG_ORIG_CLORD: u32 = 41;
+const TAG_SIDE: u32 = 54;
+const TAG_QTY: u32 = 38;
+const TAG_PRICE: u32 = 44;
+const TAG_SYMBOL: u32 = 55;
+const TAG_TIF: u32 = 59;
 
 /// FIX 4.4 acceptor. `us` is this venue's CompID; `them` is the expected client CompID.
 pub struct Fix {
     us: String,
     them: String,
+    symbol: String,
     sessions: HashMap<SessionId, Sess>,
 }
 
@@ -36,10 +46,11 @@ struct Sess {
 }
 
 impl Fix {
-    pub fn new(us: impl Into<String>, them: impl Into<String>) -> Self {
+    pub fn new(us: impl Into<String>, them: impl Into<String>, symbol: impl Into<String>) -> Self {
         Self {
             us: us.into(),
             them: them.into(),
+            symbol: symbol.into(),
             sessions: HashMap::new(),
         }
     }
@@ -77,6 +88,138 @@ impl Fix {
             out,
         )
     }
+
+    fn biz_reject(
+        &mut self,
+        session: SessionId,
+        seq_out: u64,
+        consumed: usize,
+        text: &str,
+        out: &mut [u8],
+    ) -> ParseOutcome {
+        let n = self.frame(seq_out, "j", |enc| enc.put_str(TAG_TEXT, text), out);
+        if let Some(sess) = self.sessions.get_mut(&session) {
+            sess.next_out = seq_out + 1;
+        }
+        ParseOutcome::Reply {
+            bytes: n,
+            consumed,
+        }
+    }
+
+    fn map_app(
+        &mut self,
+        ty: MsgType,
+        session: SessionId,
+        msg: &RawMessage<'_>,
+        consumed: usize,
+        seq_out: u64,
+        reply: &mut [u8],
+    ) -> ParseOutcome {
+        let sym = msg.get_field_str(TAG_SYMBOL).unwrap_or("");
+        if sym != self.symbol {
+            return self.biz_reject(session, seq_out, consumed, "symbol", reply);
+        }
+
+        let cmd = match ty {
+            MsgType::NewOrderSingle => self.cmd_add(session, msg),
+            MsgType::OrderCancelRequest => self.cmd_cancel(session, msg),
+            MsgType::OrderCancelReplaceRequest => self.cmd_modify(session, msg),
+            _ => None,
+        };
+        match cmd {
+            Some(cmd) => ParseOutcome::Command { cmd, consumed },
+            None => self.biz_reject(session, seq_out, consumed, "fields", reply),
+        }
+    }
+
+    fn cmd_add(&self, session: SessionId, msg: &RawMessage<'_>) -> Option<Command> {
+        let cl = msg.get_field_str(TAG_CLORD)?;
+        let side = Self::parse_side(msg.get_field_str(TAG_SIDE)?)?;
+        let quantity = Self::parse_qty(msg.get_field_str(TAG_QTY)?)?;
+        let price = Self::parse_price(msg.get_field_str(TAG_PRICE)?)?;
+        let mut cmd = Command::blank(CommandType::Add);
+        cmd.client_fd = session.0;
+        cmd.side = side;
+        cmd.quantity = quantity;
+        cmd.price = Price(price);
+        cmd.user_ref = Self::ref_of(cl);
+        cmd.cl_ord_id = Self::pad_clord(cl);
+        if let Some(tif) = msg.get_field_str(TAG_TIF) {
+            cmd.time_in_force = tif.as_bytes().first().copied().unwrap_or(0);
+        }
+        Some(cmd)
+    }
+
+    fn cmd_cancel(&self, session: SessionId, msg: &RawMessage<'_>) -> Option<Command> {
+        let orig = msg
+            .get_field_str(TAG_ORIG_CLORD)
+            .or_else(|| msg.get_field_str(TAG_CLORD))?;
+        let mut cmd = Command::blank(CommandType::Cancel);
+        cmd.client_fd = session.0;
+        cmd.user_ref = Self::ref_of(orig);
+        cmd.cl_ord_id = Self::pad_clord(orig);
+        if let Some(q) = msg.get_field_str(TAG_QTY).and_then(Self::parse_qty) {
+            cmd.quantity = q;
+        }
+        Some(cmd)
+    }
+
+    fn cmd_modify(&self, session: SessionId, msg: &RawMessage<'_>) -> Option<Command> {
+        let orig = msg
+            .get_field_str(TAG_ORIG_CLORD)
+            .or_else(|| msg.get_field_str(TAG_CLORD))?;
+        let mut cmd = Command::blank(CommandType::Modify);
+        cmd.client_fd = session.0;
+        cmd.user_ref = Self::ref_of(orig);
+        cmd.cl_ord_id = Self::pad_clord(orig);
+        if let Some(side) = msg.get_field_str(TAG_SIDE).and_then(Self::parse_side) {
+            cmd.side = side;
+        }
+        if let Some(q) = msg.get_field_str(TAG_QTY).and_then(Self::parse_qty) {
+            cmd.quantity = q;
+        }
+        if let Some(px) = msg.get_field_str(TAG_PRICE).and_then(Self::parse_price) {
+            cmd.price = Price(px);
+        }
+        Some(cmd)
+    }
+
+fn pad_clord(s: &str) -> [u8; 14] {
+    let mut id = [b' '; 14];
+    let b = s.as_bytes();
+    let n = b.len().min(14);
+    id[..n].copy_from_slice(&b[..n]);
+    id
+}
+
+fn ref_of(s: &str) -> u32 {
+    let mut h = 2166136261u32;
+    for &b in s.as_bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
+fn parse_side(s: &str) -> Option<Side> {
+    match s {
+        "1" => Some(Side::Bid),
+        "2" => Some(Side::Ask),
+        _ => None,
+    }
+}
+
+fn parse_qty(s: &str) -> Option<u64> {
+    s.parse().ok()
+}
+
+fn parse_price(s: &str) -> Option<u64> {
+    if let Ok(v) = s.parse::<u64>() {
+        return Some(v);
+    }
+    s.parse::<f64>().ok().map(|v| v as u64)
+}
 
     fn handle(
         &mut self,
@@ -224,6 +367,11 @@ impl Fix {
                     consumed,
                 }
             }
+            MsgType::NewOrderSingle
+            | MsgType::OrderCancelRequest
+            | MsgType::OrderCancelReplaceRequest => {
+                self.map_app(ty.clone(), session, msg, consumed, next_out, reply)
+            }
             _ => ParseOutcome::Reply {
                 bytes: 0,
                 consumed,
@@ -315,7 +463,7 @@ mod tests {
 
     #[test]
     fn truncated_needs_more() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let hb = heartbeat();
         assert!(matches!(
             parse_on(&mut fix, &hb[..hb.len() / 2], &mut [0u8; 8]),
@@ -329,7 +477,7 @@ mod tests {
 
     #[test]
     fn bad_checksum_is_bad() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let mut hb = heartbeat();
         let i = hb.iter().position(|&b| b == b'=').expect("tag 8");
         hb[i + 1] ^= 0x01;
@@ -344,7 +492,7 @@ mod tests {
 
     #[test]
     fn logon_replies_logon() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let mut reply = [0u8; 512];
         match parse_on(&mut fix, &logon(1, 30), &mut reply) {
             ParseOutcome::Reply { bytes, consumed } => {
@@ -357,7 +505,7 @@ mod tests {
 
     #[test]
     fn heartbeat_after_logon_consumed() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let mut reply = [0u8; 512];
         assert!(matches!(
             parse_on(&mut fix, &logon(1, 30), &mut reply),
@@ -374,7 +522,7 @@ mod tests {
 
     #[test]
     fn logout_replies_logout() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let mut reply = [0u8; 512];
         assert!(matches!(
             parse_on(&mut fix, &logon(1, 30), &mut reply),
@@ -390,7 +538,7 @@ mod tests {
 
     #[test]
     fn unexpected_seq_disconnects() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let mut reply = [0u8; 512];
         assert!(matches!(
             parse_on(&mut fix, &logon(1, 30), &mut reply),
@@ -406,7 +554,7 @@ mod tests {
 
     #[test]
     fn idle_heartbeat_after_interval() {
-        let mut fix = Fix::new("VENUE", "CLIENT");
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
         let mut reply = [0u8; 512];
         assert!(matches!(
             parse_on(&mut fix, &logon(1, 1), &mut reply),
@@ -417,5 +565,87 @@ mod tests {
         assert!(n > 0);
         assert_eq!(decode_type(&reply[..n]), MsgType::Heartbeat);
         assert_eq!(fix.on_idle(later, SID, &mut reply), 0);
+    }
+
+    fn logged_in() -> (Fix, [u8; 512]) {
+        let mut fix = Fix::new("VENUE", "CLIENT", "AAPL");
+        let mut reply = [0u8; 512];
+        assert!(matches!(
+            parse_on(&mut fix, &logon(1, 30), &mut reply),
+            ParseOutcome::Reply { .. }
+        ));
+        (fix, reply)
+    }
+
+    #[test]
+    fn new_order_single_is_add() {
+        let (mut fix, mut reply) = logged_in();
+        let wire = client_frame(2, "D", |enc| {
+            enc.put_str(TAG_CLORD, "ORD1");
+            enc.put_str(TAG_SYMBOL, "AAPL");
+            enc.put_str(TAG_SIDE, "1");
+            enc.put_str(TAG_QTY, "10");
+            enc.put_str(TAG_PRICE, "100");
+        });
+        match parse_on(&mut fix, &wire, &mut reply) {
+            ParseOutcome::Command { cmd, .. } => {
+                assert_eq!(cmd.ty, CommandType::Add);
+                assert_eq!(cmd.side, Side::Bid);
+                assert_eq!(cmd.quantity, 10);
+                assert_eq!(cmd.price, Price(100));
+                assert_eq!(cmd.client_fd, 1);
+            }
+            _ => panic!("expected Command"),
+        }
+    }
+
+    #[test]
+    fn wrong_symbol_is_not_a_command() {
+        let (mut fix, mut reply) = logged_in();
+        let wire = client_frame(2, "D", |enc| {
+            enc.put_str(TAG_CLORD, "ORD1");
+            enc.put_str(TAG_SYMBOL, "MSFT");
+            enc.put_str(TAG_SIDE, "1");
+            enc.put_str(TAG_QTY, "10");
+            enc.put_str(TAG_PRICE, "100");
+        });
+        match parse_on(&mut fix, &wire, &mut reply) {
+            ParseOutcome::Reply { bytes, .. } => {
+                assert!(bytes > 0);
+                assert_eq!(decode_type(&reply[..bytes]), MsgType::BusinessMessageReject);
+            }
+            _ => panic!("expected adapter reject"),
+        }
+    }
+
+    #[test]
+    fn cancel_and_replace_map() {
+        let (mut fix, mut reply) = logged_in();
+        let cancel = client_frame(2, "F", |enc| {
+            enc.put_str(TAG_CLORD, "CXL1");
+            enc.put_str(TAG_ORIG_CLORD, "ORD1");
+            enc.put_str(TAG_SYMBOL, "AAPL");
+        });
+        match parse_on(&mut fix, &cancel, &mut reply) {
+            ParseOutcome::Command { cmd, .. } => assert_eq!(cmd.ty, CommandType::Cancel),
+            _ => panic!("expected Cancel"),
+        }
+        let replace = client_frame(3, "G", |enc| {
+            enc.put_str(TAG_CLORD, "ORD2");
+            enc.put_str(TAG_ORIG_CLORD, "ORD1");
+            enc.put_str(TAG_SYMBOL, "AAPL");
+            enc.put_str(TAG_SIDE, "2");
+            enc.put_str(TAG_QTY, "5");
+            enc.put_str(TAG_PRICE, "99");
+        });
+        match parse_on(&mut fix, &replace, &mut reply) {
+            ParseOutcome::Command { cmd, .. } => {
+                assert_eq!(cmd.ty, CommandType::Modify);
+                assert_eq!(cmd.side, Side::Ask);
+                assert_eq!(cmd.quantity, 5);
+                assert_eq!(cmd.price, Price(99));
+            }
+            _ => panic!("expected Modify"),
+        }
     }
 }
