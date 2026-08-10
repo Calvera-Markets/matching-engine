@@ -103,6 +103,14 @@ impl<Oe: OrderEntry> Ingress<Oe> {
                             ParseOutcome::Bad { consumed } => {
                                 off += consumed.max(1);
                             }
+                            ParseOutcome::Disconnect { bytes, consumed } => {
+                                if bytes > 0 {
+                                    let _ = client.stream.write_all(&reply[..bytes]);
+                                }
+                                off += consumed.max(1);
+                                dead.push(fd);
+                                break;
+                            }
                         }
                     }
                     if off > 0 {
@@ -111,7 +119,7 @@ impl<Oe: OrderEntry> Ingress<Oe> {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let n = self.oe.on_idle(now, &mut reply);
+                    let n = self.oe.on_idle(now, SessionId(fd), &mut reply);
                     if n > 0 {
                         let _ = client.stream.write_all(&reply[..n]);
                     }

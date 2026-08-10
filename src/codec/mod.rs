@@ -24,8 +24,10 @@ pub enum ParseOutcome {
     Reply { bytes: usize, consumed: usize },
     /// Not enough data for a complete message.
     NeedMore,
-    /// Malformed bytes. Skip `consumed` (often 1) and keep scanning, or drop the session.
+    /// Malformed bytes. Skip `consumed` (often 1) and keep scanning.
     Bad { consumed: usize },
+    /// Session is dead. Write `reply[..bytes]` if nonzero, then drop the connection.
+    Disconnect { bytes: usize, consumed: usize },
 }
 
 /// Private order-entry protocol: inbound parse, outbound acks, optional session idle.
@@ -35,8 +37,8 @@ pub trait OrderEntry {
     /// Serialize an engine `Event` into `out`. Returns bytes written, or 0 to skip.
     fn encode_event(&mut self, evt: &Event, out: &mut [u8]) -> usize;
 
-    /// Called when the read loop is idle. FIX heartbeats; OUCH/SBE no-op.
-    fn on_idle(&mut self, _now: Instant, _reply: &mut [u8]) -> usize {
+    /// Called when the read loop is idle for `session`. FIX heartbeats; OUCH/SBE no-op.
+    fn on_idle(&mut self, _now: Instant, _session: SessionId, _reply: &mut [u8]) -> usize {
         0
     }
 
