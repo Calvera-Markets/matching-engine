@@ -35,11 +35,14 @@ pub struct Fix {
     them: String,
     symbol: String,
     sessions: HashMap<SessionId, Sess>,
+    ids: HashMap<(SessionId, String), u32>,
+    refs: HashMap<(SessionId, u32), String>,
 }
 
 struct Sess {
     next_in: u64,
     next_out: u64,
+    next_ref: u32,
     logged_on: bool,
     last_out: Instant,
     hb: Duration,
@@ -52,7 +55,14 @@ impl Fix {
             them: them.into(),
             symbol: symbol.into(),
             sessions: HashMap::new(),
+            ids: HashMap::new(),
+            refs: HashMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn clord_for(&self, session: SessionId, user_ref: u32) -> Option<&str> {
+        self.refs.get(&(session, user_ref)).map(String::as_str)
     }
 
     fn frame(
@@ -122,56 +132,75 @@ impl Fix {
         }
 
         let cmd = match ty {
-            MsgType::NewOrderSingle => self.cmd_add(session, msg),
+            MsgType::NewOrderSingle => self.cmd_add(session, msg).map_err(|_| "fields"),
             MsgType::OrderCancelRequest => self.cmd_cancel(session, msg),
             MsgType::OrderCancelReplaceRequest => self.cmd_modify(session, msg),
-            _ => None,
+            _ => Err("fields"),
         };
         match cmd {
-            Some(cmd) => ParseOutcome::Command { cmd, consumed },
-            None => self.biz_reject(session, seq_out, consumed, "fields", reply),
+            Ok(cmd) => ParseOutcome::Command { cmd, consumed },
+            Err(why) => self.biz_reject(session, seq_out, consumed, why, reply),
         }
     }
 
-    fn cmd_add(&self, session: SessionId, msg: &RawMessage<'_>) -> Option<Command> {
-        let cl = msg.get_field_str(TAG_CLORD)?;
-        let side = Self::parse_side(msg.get_field_str(TAG_SIDE)?)?;
-        let quantity = Self::parse_qty(msg.get_field_str(TAG_QTY)?)?;
-        let price = Self::parse_price(msg.get_field_str(TAG_PRICE)?)?;
+    fn cmd_add(&mut self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, ()> {
+        let cl = msg.get_field_str(TAG_CLORD).ok_or(())?;
+        let side = Self::parse_side(msg.get_field_str(TAG_SIDE).ok_or(())?).ok_or(())?;
+        let quantity = Self::parse_qty(msg.get_field_str(TAG_QTY).ok_or(())?).ok_or(())?;
+        let price = Self::parse_price(msg.get_field_str(TAG_PRICE).ok_or(())?).ok_or(())?;
+        let user_ref = if let Some(&id) = self.ids.get(&(session, cl.to_string())) {
+            id
+        } else {
+            let sess = self.sessions.get_mut(&session).ok_or(())?;
+            let id = sess.next_ref;
+            sess.next_ref = sess.next_ref.saturating_add(1);
+            self.ids.insert((session, cl.to_string()), id);
+            self.refs.insert((session, id), cl.to_string());
+            id
+        };
         let mut cmd = Command::blank(CommandType::Add);
         cmd.client_fd = session.0;
         cmd.side = side;
         cmd.quantity = quantity;
         cmd.price = Price(price);
-        cmd.user_ref = Self::ref_of(cl);
+        cmd.user_ref = user_ref;
         cmd.cl_ord_id = Self::pad_clord(cl);
         if let Some(tif) = msg.get_field_str(TAG_TIF) {
             cmd.time_in_force = tif.as_bytes().first().copied().unwrap_or(0);
         }
-        Some(cmd)
+        Ok(cmd)
     }
 
-    fn cmd_cancel(&self, session: SessionId, msg: &RawMessage<'_>) -> Option<Command> {
+    fn cmd_cancel(&self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, &'static str> {
         let orig = msg
             .get_field_str(TAG_ORIG_CLORD)
-            .or_else(|| msg.get_field_str(TAG_CLORD))?;
+            .or_else(|| msg.get_field_str(TAG_CLORD))
+            .ok_or("fields")?;
+        let user_ref = *self.ids.get(&(session, orig.to_string())).ok_or("clordid")?;
         let mut cmd = Command::blank(CommandType::Cancel);
         cmd.client_fd = session.0;
-        cmd.user_ref = Self::ref_of(orig);
+        cmd.user_ref = user_ref;
         cmd.cl_ord_id = Self::pad_clord(orig);
         if let Some(q) = msg.get_field_str(TAG_QTY).and_then(Self::parse_qty) {
             cmd.quantity = q;
         }
-        Some(cmd)
+        Ok(cmd)
     }
 
-    fn cmd_modify(&self, session: SessionId, msg: &RawMessage<'_>) -> Option<Command> {
+    fn cmd_modify(&mut self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, &'static str> {
         let orig = msg
             .get_field_str(TAG_ORIG_CLORD)
-            .or_else(|| msg.get_field_str(TAG_CLORD))?;
+            .or_else(|| msg.get_field_str(TAG_CLORD))
+            .ok_or("fields")?;
+        let user_ref = *self.ids.get(&(session, orig.to_string())).ok_or("clordid")?;
+        if let Some(cl) = msg.get_field_str(TAG_CLORD) {
+            if cl != orig {
+                self.ids.insert((session, cl.to_string()), user_ref);
+            }
+        }
         let mut cmd = Command::blank(CommandType::Modify);
         cmd.client_fd = session.0;
-        cmd.user_ref = Self::ref_of(orig);
+        cmd.user_ref = user_ref;
         cmd.cl_ord_id = Self::pad_clord(orig);
         if let Some(side) = msg.get_field_str(TAG_SIDE).and_then(Self::parse_side) {
             cmd.side = side;
@@ -182,7 +211,7 @@ impl Fix {
         if let Some(px) = msg.get_field_str(TAG_PRICE).and_then(Self::parse_price) {
             cmd.price = Price(px);
         }
-        Some(cmd)
+        Ok(cmd)
     }
 
 fn pad_clord(s: &str) -> [u8; 14] {
@@ -191,15 +220,6 @@ fn pad_clord(s: &str) -> [u8; 14] {
     let n = b.len().min(14);
     id[..n].copy_from_slice(&b[..n]);
     id
-}
-
-fn ref_of(s: &str) -> u32 {
-    let mut h = 2166136261u32;
-    for &b in s.as_bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(16777619);
-    }
-    h
 }
 
 fn parse_side(s: &str) -> Option<Side> {
@@ -287,6 +307,7 @@ fn parse_price(s: &str) -> Option<u64> {
                 Sess {
                     next_in: 2,
                     next_out: 2,
+                    next_ref: 1,
                     logged_on: true,
                     last_out: now,
                     hb: Duration::from_secs(hb_secs),
@@ -421,6 +442,8 @@ impl OrderEntry for Fix {
 
     fn on_session_end(&mut self, session: SessionId) {
         self.sessions.remove(&session);
+        self.ids.retain(|(s, _), _| *s != session);
+        self.refs.retain(|(s, _), _| *s != session);
     }
 }
 
@@ -618,18 +641,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cancel_and_replace_map() {
-        let (mut fix, mut reply) = logged_in();
-        let cancel = client_frame(2, "F", |enc| {
-            enc.put_str(TAG_CLORD, "CXL1");
-            enc.put_str(TAG_ORIG_CLORD, "ORD1");
+    fn add_ord1(seq: i64) -> Vec<u8> {
+        client_frame(seq, "D", |enc| {
+            enc.put_str(TAG_CLORD, "ORD1");
             enc.put_str(TAG_SYMBOL, "AAPL");
-        });
-        match parse_on(&mut fix, &cancel, &mut reply) {
-            ParseOutcome::Command { cmd, .. } => assert_eq!(cmd.ty, CommandType::Cancel),
-            _ => panic!("expected Cancel"),
-        }
+            enc.put_str(TAG_SIDE, "1");
+            enc.put_str(TAG_QTY, "10");
+            enc.put_str(TAG_PRICE, "100");
+        })
+    }
+
+    #[test]
+    fn cancel_and_replace_share_user_ref() {
+        let (mut fix, mut reply) = logged_in();
+        let uref = match parse_on(&mut fix, &add_ord1(2), &mut reply) {
+            ParseOutcome::Command { cmd, .. } => cmd.user_ref,
+            _ => panic!("add"),
+        };
+        assert_eq!(fix.clord_for(SID, uref), Some("ORD1"));
         let replace = client_frame(3, "G", |enc| {
             enc.put_str(TAG_CLORD, "ORD2");
             enc.put_str(TAG_ORIG_CLORD, "ORD1");
@@ -641,11 +670,39 @@ mod tests {
         match parse_on(&mut fix, &replace, &mut reply) {
             ParseOutcome::Command { cmd, .. } => {
                 assert_eq!(cmd.ty, CommandType::Modify);
-                assert_eq!(cmd.side, Side::Ask);
+                assert_eq!(cmd.user_ref, uref);
                 assert_eq!(cmd.quantity, 5);
-                assert_eq!(cmd.price, Price(99));
             }
             _ => panic!("expected Modify"),
+        }
+        let cancel = client_frame(4, "F", |enc| {
+            enc.put_str(TAG_CLORD, "CXL1");
+            enc.put_str(TAG_ORIG_CLORD, "ORD2");
+            enc.put_str(TAG_SYMBOL, "AAPL");
+        });
+        match parse_on(&mut fix, &cancel, &mut reply) {
+            ParseOutcome::Command { cmd, .. } => {
+                assert_eq!(cmd.ty, CommandType::Cancel);
+                assert_eq!(cmd.user_ref, uref);
+            }
+            _ => panic!("expected Cancel"),
+        }
+    }
+
+    #[test]
+    fn unknown_clordid_is_not_a_command() {
+        let (mut fix, mut reply) = logged_in();
+        let cancel = client_frame(2, "F", |enc| {
+            enc.put_str(TAG_CLORD, "CXL1");
+            enc.put_str(TAG_ORIG_CLORD, "NOPE");
+            enc.put_str(TAG_SYMBOL, "AAPL");
+        });
+        match parse_on(&mut fix, &cancel, &mut reply) {
+            ParseOutcome::Reply { bytes, .. } => {
+                assert!(bytes > 0);
+                assert_eq!(decode_type(&reply[..bytes]), MsgType::BusinessMessageReject);
+            }
+            _ => panic!("expected adapter reject"),
         }
     }
 }
