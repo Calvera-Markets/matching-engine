@@ -33,3 +33,8 @@ harness = false
 [[example]]
 name = "tape_replay"
 path = "examples/tape_replay.rs"
+
+[[example]]
+name = "fix"
+path = "examples/fix.rs"
+required-features = ["fix", "itch"]

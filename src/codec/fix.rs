@@ -1,6 +1,7 @@
 //! FIX 4.4 order-entry codec.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ironfix_core::error::DecodeError;
@@ -29,8 +30,15 @@ const TAG_PRICE: u32 = 44;
 const TAG_SYMBOL: u32 = 55;
 const TAG_TIF: u32 = 59;
 
-/// FIX 4.4 acceptor. `us` is this venue's CompID; `them` is the expected client CompID.
+/// FIX 4.4 acceptor. Clone to share one session table across ingress and egress.
+#[derive(Clone)]
 pub struct Fix {
+    // TODO: consider if a ring buffer or disruptor should be used here
+    inner: Arc<Mutex<Inner>>,
+}
+
+/// `us` is this venue's CompID; `them` is the expected client CompID.
+struct Inner {
     us: String,
     them: String,
     symbol: String,
@@ -53,21 +61,31 @@ struct Sess {
 impl Fix {
     pub fn new(us: impl Into<String>, them: impl Into<String>, symbol: impl Into<String>) -> Self {
         Self {
-            us: us.into(),
-            them: them.into(),
-            symbol: symbol.into(),
-            sessions: HashMap::new(),
-            ids: HashMap::new(),
-            refs: HashMap::new(),
-            last_ref: HashMap::new(),
-            next_exec: 1,
+            inner: Arc::new(Mutex::new(Inner {
+                us: us.into(),
+                them: them.into(),
+                symbol: symbol.into(),
+                sessions: HashMap::new(),
+                ids: HashMap::new(),
+                refs: HashMap::new(),
+                last_ref: HashMap::new(),
+                next_exec: 1,
+            })),
         }
     }
 
     #[cfg(test)]
-    fn clord_for(&self, session: SessionId, user_ref: u32) -> Option<&str> {
-        self.refs.get(&(session, user_ref)).map(String::as_str)
+    fn clord_for(&self, session: SessionId, user_ref: u32) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("fix")
+            .refs
+            .get(&(session, user_ref))
+            .cloned()
     }
+}
+
+impl Inner {
 
     fn clord_of(&self, sid: SessionId, uref: u32, fallback: &[u8; 14]) -> String {
         if let Some(s) = self.refs.get(&(sid, uref)) {
@@ -562,10 +580,6 @@ fn parse_price(s: &str) -> Option<u64> {
             },
         }
     }
-}
-
-impl OrderEntry for Fix {
-    const MAX_OUT: usize = 1024;
 
     fn parse(&mut self, buf: &[u8], session: SessionId, reply: &mut [u8]) -> ParseOutcome {
         if buf.is_empty() {
@@ -580,10 +594,6 @@ impl OrderEntry for Fix {
                 consumed: dec.offset().clamp(1, buf.len()),
             },
         }
-    }
-
-    fn encode_event(&mut self, evt: &Event, out: &mut [u8]) -> usize {
-        self.write_exec(evt, out)
     }
 
     fn on_idle(&mut self, now: Instant, session: SessionId, reply: &mut [u8]) -> usize {
@@ -610,6 +620,26 @@ impl OrderEntry for Fix {
         self.ids.retain(|(s, _), _| *s != session);
         self.refs.retain(|(s, _), _| *s != session);
         self.last_ref.remove(&session);
+    }
+}
+
+impl OrderEntry for Fix {
+    const MAX_OUT: usize = 1024;
+
+    fn parse(&mut self, buf: &[u8], session: SessionId, reply: &mut [u8]) -> ParseOutcome {
+        self.inner.lock().expect("fix").parse(buf, session, reply)
+    }
+
+    fn encode_event(&mut self, evt: &Event, out: &mut [u8]) -> usize {
+        self.inner.lock().expect("fix").write_exec(evt, out)
+    }
+
+    fn on_idle(&mut self, now: Instant, session: SessionId, reply: &mut [u8]) -> usize {
+        self.inner.lock().expect("fix").on_idle(now, session, reply)
+    }
+
+    fn on_session_end(&mut self, session: SessionId) {
+        self.inner.lock().expect("fix").on_session_end(session)
     }
 }
 
@@ -824,7 +854,7 @@ mod tests {
             ParseOutcome::Command { cmd, .. } => cmd.user_ref,
             _ => panic!("add"),
         };
-        assert_eq!(fix.clord_for(SID, uref), Some("ORD1"));
+        assert_eq!(fix.clord_for(SID, uref).as_deref(), Some("ORD1"));
         let replace = client_frame(3, "G", |enc| {
             enc.put_str(TAG_CLORD, "ORD2");
             enc.put_str(TAG_ORIG_CLORD, "ORD1");
@@ -890,7 +920,7 @@ mod tests {
                 quantity: 10,
                 side: Side::Bid,
                 order_state: b'L',
-                cl_ord_id: Fix::pad_clord("ORD1"),
+                cl_ord_id: Inner::pad_clord("ORD1"),
             },
         );
         let n = fix.encode_event(&acc, &mut reply);
