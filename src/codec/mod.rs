@@ -32,6 +32,10 @@ pub enum ParseOutcome {
 
 /// Private order-entry protocol: inbound parse, outbound acks, optional session idle.
 pub trait OrderEntry {
+    /// Scratch for `parse` replies and `encode_event`. OUCH fits in 128; FIX does not.
+    /// TODO: This is a default, perhaps to be moved out
+    const MAX_OUT: usize = 128;
+
     fn parse(&mut self, buf: &[u8], session: SessionId, reply: &mut [u8]) -> ParseOutcome;
 
     /// Serialize an engine `Event` into `out`. Returns bytes written, or 0 to skip.

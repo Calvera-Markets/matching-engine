@@ -10,7 +10,7 @@ use ironfix_tagvalue::{Decoder, Encoder};
 use calvera_books::{Price, Side};
 
 use crate::codec::{OrderEntry, ParseOutcome, SessionId};
-use crate::types::{Command, CommandType, Event};
+use crate::types::{Command, CommandType, Event, EventType};
 
 const BEGIN: &str = "FIX.4.4";
 const TAG_SENDER: u32 = 49;
@@ -37,6 +37,8 @@ pub struct Fix {
     sessions: HashMap<SessionId, Sess>,
     ids: HashMap<(SessionId, String), u32>,
     refs: HashMap<(SessionId, u32), String>,
+    last_ref: HashMap<SessionId, u32>,
+    next_exec: u64,
 }
 
 struct Sess {
@@ -57,12 +59,163 @@ impl Fix {
             sessions: HashMap::new(),
             ids: HashMap::new(),
             refs: HashMap::new(),
+            last_ref: HashMap::new(),
+            next_exec: 1,
         }
     }
 
     #[cfg(test)]
     fn clord_for(&self, session: SessionId, user_ref: u32) -> Option<&str> {
         self.refs.get(&(session, user_ref)).map(String::as_str)
+    }
+
+    fn clord_of(&self, sid: SessionId, uref: u32, fallback: &[u8; 14]) -> String {
+        if let Some(s) = self.refs.get(&(sid, uref)) {
+            return s.clone();
+        }
+        String::from_utf8_lossy(fallback)
+            .trim()
+            .to_string()
+    }
+
+    fn trade_uref(&self, sid: SessionId, evt: &Event) -> u32 {
+        if self.refs.contains_key(&(sid, evt.trade.maker_user_ref)) {
+            evt.trade.maker_user_ref
+        } else {
+            self.last_ref.get(&sid).copied().unwrap_or(0)
+        }
+    }
+
+    fn write_exec(&mut self, evt: &Event, out: &mut [u8]) -> usize {
+        if evt.ty == EventType::BookReset || evt.client_fd < 0 {
+            return 0;
+        }
+        let sid = SessionId(evt.client_fd);
+        let seq = {
+            let Some(sess) = self.sessions.get_mut(&sid) else {
+                return 0;
+            };
+            if !sess.logged_on {
+                return 0;
+            }
+            let seq = sess.next_out;
+            sess.next_out += 1;
+            sess.last_out = Instant::now();
+            seq
+        };
+        let exec_id = self.next_exec;
+        self.next_exec += 1;
+        let exec_id_s = exec_id.to_string();
+
+        match evt.ty {
+            EventType::OrderAccepted => {
+                let cl = self.clord_of(sid, evt.order.user_ref, &evt.order.cl_ord_id);
+                let oid = evt.order.order_id.to_string();
+                let qty = evt.order.quantity.to_string();
+                let px = evt.order.price.0.to_string();
+                let side = Self::side_fix(evt.order.side);
+                self.frame(
+                    seq,
+                    "8",
+                    |enc| {
+                        enc.put_str(11, &cl);
+                        enc.put_str(17, &exec_id_s);
+                        enc.put_str(150, "0");
+                        enc.put_str(39, "0");
+                        enc.put_str(54, side);
+                        enc.put_str(38, &qty);
+                        enc.put_str(44, &px);
+                        enc.put_str(37, &oid);
+                    },
+                    out,
+                )
+            }
+            EventType::OrderCancelled => {
+                let cl = self.clord_of(sid, evt.order.user_ref, &evt.order.cl_ord_id);
+                let oid = evt.order.order_id.to_string();
+                self.frame(
+                    seq,
+                    "8",
+                    |enc| {
+                        enc.put_str(11, &cl);
+                        enc.put_str(17, &exec_id_s);
+                        enc.put_str(150, "4");
+                        enc.put_str(39, "4");
+                        enc.put_str(37, &oid);
+                        enc.put_str(54, Self::side_fix(evt.order.side));
+                    },
+                    out,
+                )
+            }
+            EventType::OrderModified => {
+                let cl = self.clord_of(sid, evt.order.user_ref, &evt.order.cl_ord_id);
+                let oid = evt.order.order_id.to_string();
+                let qty = evt.order.quantity.to_string();
+                let px = evt.order.price.0.to_string();
+                self.frame(
+                    seq,
+                    "8",
+                    |enc| {
+                        enc.put_str(11, &cl);
+                        enc.put_str(17, &exec_id_s);
+                        enc.put_str(150, "5");
+                        enc.put_str(39, "5");
+                        enc.put_str(54, Self::side_fix(evt.order.side));
+                        enc.put_str(38, &qty);
+                        enc.put_str(44, &px);
+                        enc.put_str(37, &oid);
+                    },
+                    out,
+                )
+            }
+            EventType::OrderRejected => {
+                let cl = self.clord_of(sid, evt.reject.user_ref, &evt.reject.cl_ord_id);
+                let reason = evt.reject.reason.to_string();
+                self.frame(
+                    seq,
+                    "8",
+                    |enc| {
+                        enc.put_str(11, &cl);
+                        enc.put_str(17, &exec_id_s);
+                        enc.put_str(150, "8");
+                        enc.put_str(39, "8");
+                        enc.put_str(103, &reason);
+                    },
+                    out,
+                )
+            }
+            EventType::TradeExecuted => {
+                let uref = self.trade_uref(sid, evt);
+                let cl = self.clord_of(sid, uref, &evt.order.cl_ord_id);
+                let last_qty = evt.trade.quantity.to_string();
+                let last_px = evt.trade.price.0.to_string();
+                let oid = evt.trade.maker_exchange_id.to_string();
+                let side = if self.refs.contains_key(&(sid, evt.trade.maker_user_ref)) {
+                    Self::side_fix(match evt.trade.taker_side {
+                        Side::Bid => Side::Ask,
+                        Side::Ask => Side::Bid,
+                    })
+                } else {
+                    Self::side_fix(evt.trade.taker_side)
+                };
+                self.frame(
+                    seq,
+                    "8",
+                    |enc| {
+                        enc.put_str(11, &cl);
+                        enc.put_str(17, &exec_id_s);
+                        enc.put_str(150, "F");
+                        enc.put_str(39, "1");
+                        enc.put_str(54, side);
+                        enc.put_str(31, &last_px);
+                        enc.put_str(32, &last_qty);
+                        enc.put_str(37, &oid);
+                    },
+                    out,
+                )
+            }
+            EventType::BookReset => 0,
+        }
     }
 
     fn frame(
@@ -168,10 +321,11 @@ impl Fix {
         if let Some(tif) = msg.get_field_str(TAG_TIF) {
             cmd.time_in_force = tif.as_bytes().first().copied().unwrap_or(0);
         }
+        self.last_ref.insert(session, user_ref);
         Ok(cmd)
     }
 
-    fn cmd_cancel(&self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, &'static str> {
+    fn cmd_cancel(&mut self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, &'static str> {
         let orig = msg
             .get_field_str(TAG_ORIG_CLORD)
             .or_else(|| msg.get_field_str(TAG_CLORD))
@@ -184,6 +338,7 @@ impl Fix {
         if let Some(q) = msg.get_field_str(TAG_QTY).and_then(Self::parse_qty) {
             cmd.quantity = q;
         }
+        self.last_ref.insert(session, user_ref);
         Ok(cmd)
     }
 
@@ -211,6 +366,7 @@ impl Fix {
         if let Some(px) = msg.get_field_str(TAG_PRICE).and_then(Self::parse_price) {
             cmd.price = Price(px);
         }
+        self.last_ref.insert(session, user_ref);
         Ok(cmd)
     }
 
@@ -220,6 +376,13 @@ fn pad_clord(s: &str) -> [u8; 14] {
     let n = b.len().min(14);
     id[..n].copy_from_slice(&b[..n]);
     id
+}
+
+fn side_fix(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "1",
+        Side::Ask => "2",
+    }
 }
 
 fn parse_side(s: &str) -> Option<Side> {
@@ -402,6 +565,8 @@ fn parse_price(s: &str) -> Option<u64> {
 }
 
 impl OrderEntry for Fix {
+    const MAX_OUT: usize = 1024;
+
     fn parse(&mut self, buf: &[u8], session: SessionId, reply: &mut [u8]) -> ParseOutcome {
         if buf.is_empty() {
             return ParseOutcome::NeedMore;
@@ -417,8 +582,8 @@ impl OrderEntry for Fix {
         }
     }
 
-    fn encode_event(&mut self, _evt: &Event, _out: &mut [u8]) -> usize {
-        0
+    fn encode_event(&mut self, evt: &Event, out: &mut [u8]) -> usize {
+        self.write_exec(evt, out)
     }
 
     fn on_idle(&mut self, now: Instant, session: SessionId, reply: &mut [u8]) -> usize {
@@ -444,6 +609,7 @@ impl OrderEntry for Fix {
         self.sessions.remove(&session);
         self.ids.retain(|(s, _), _| *s != session);
         self.refs.retain(|(s, _), _| *s != session);
+        self.last_ref.remove(&session);
     }
 }
 
@@ -704,5 +870,60 @@ mod tests {
             }
             _ => panic!("expected adapter reject"),
         }
+    }
+
+    #[test]
+    fn encode_accept_and_trade_tags() {
+        use crate::types::{Event, EventOrder, EventTrade};
+
+        let (mut fix, mut reply) = logged_in();
+        let uref = match parse_on(&mut fix, &add_ord1(2), &mut reply) {
+            ParseOutcome::Command { cmd, .. } => cmd.user_ref,
+            _ => panic!("add"),
+        };
+        let acc = Event::accepted(
+            SID.0,
+            EventOrder {
+                order_id: 42,
+                user_ref: uref,
+                price: Price(100),
+                quantity: 10,
+                side: Side::Bid,
+                order_state: b'L',
+                cl_ord_id: Fix::pad_clord("ORD1"),
+            },
+        );
+        let n = fix.encode_event(&acc, &mut reply);
+        assert!(n > 0);
+        {
+            let mut dec = Decoder::new(&reply[..n]).with_checksum_validation(true);
+            let msg = dec.decode().expect("er");
+            assert_eq!(msg.msg_type().clone(), MsgType::ExecutionReport);
+            assert_eq!(msg.get_field_str(11), Some("ORD1"));
+            assert!(msg.get_field_str(17).is_some());
+            assert_eq!(msg.get_field_str(39), Some("0"));
+            assert_eq!(msg.get_field_str(150), Some("0"));
+        }
+
+        let tr = Event::trade(
+            SID.0,
+            EventTrade {
+                match_number: 1,
+                maker_exchange_id: 42,
+                maker_user_ref: uref,
+                price: Price(100),
+                quantity: 3,
+                taker_side: Side::Ask,
+            },
+        );
+        let n = fix.encode_event(&tr, &mut reply);
+        let mut dec = Decoder::new(&reply[..n]).with_checksum_validation(true);
+        let msg = dec.decode().expect("tr");
+        assert_eq!(msg.get_field_str(11), Some("ORD1"));
+        assert!(msg.get_field_str(17).is_some());
+        assert_eq!(msg.get_field_str(31), Some("100"));
+        assert_eq!(msg.get_field_str(32), Some("3"));
+        assert_eq!(msg.get_field_str(39), Some("1"));
+        assert_eq!(msg.get_field_str(150), Some("F"));
     }
 }

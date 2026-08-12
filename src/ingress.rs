@@ -13,7 +13,6 @@ use crate::spsc::Spsc;
 use crate::types::Command;
 
 const READ_BUF: usize = 4096;
-const REPLY_BUF: usize = 1024;
 
 struct Client {
     stream: TcpStream,
@@ -26,6 +25,7 @@ pub struct Ingress<Oe> {
     clients: HashMap<i32, Client>,
     cmds: Arc<Spsc<Command>>,
     oe: Oe,
+    reply: Vec<u8>,
 }
 
 impl<Oe: OrderEntry> Ingress<Oe> {
@@ -37,6 +37,7 @@ impl<Oe: OrderEntry> Ingress<Oe> {
             clients: HashMap::new(),
             cmds,
             oe,
+            reply: vec![0; Oe::MAX_OUT],
         })
     }
 
@@ -72,7 +73,6 @@ impl<Oe: OrderEntry> Ingress<Oe> {
     fn read_all(&mut self) {
         let mut dead = Vec::new();
         let fds: Vec<i32> = self.clients.keys().copied().collect();
-        let mut reply = [0u8; REPLY_BUF];
         let now = Instant::now();
         for fd in fds {
             let Some(client) = self.clients.get_mut(&fd) else {
@@ -87,7 +87,7 @@ impl<Oe: OrderEntry> Ingress<Oe> {
                         match self.oe.parse(
                             &client.buf[off..client.len],
                             SessionId(fd),
-                            &mut reply,
+                            &mut self.reply,
                         ) {
                             ParseOutcome::Command { cmd, consumed } => {
                                 self.cmds.push(cmd);
@@ -95,7 +95,7 @@ impl<Oe: OrderEntry> Ingress<Oe> {
                             }
                             ParseOutcome::Reply { bytes, consumed } => {
                                 if bytes > 0 {
-                                    let _ = client.stream.write_all(&reply[..bytes]);
+                                    let _ = client.stream.write_all(&self.reply[..bytes]);
                                 }
                                 off += consumed.max(1);
                             }
@@ -105,7 +105,7 @@ impl<Oe: OrderEntry> Ingress<Oe> {
                             }
                             ParseOutcome::Disconnect { bytes, consumed } => {
                                 if bytes > 0 {
-                                    let _ = client.stream.write_all(&reply[..bytes]);
+                                    let _ = client.stream.write_all(&self.reply[..bytes]);
                                 }
                                 off += consumed.max(1);
                                 dead.push(fd);
@@ -119,9 +119,9 @@ impl<Oe: OrderEntry> Ingress<Oe> {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let n = self.oe.on_idle(now, SessionId(fd), &mut reply);
+                    let n = self.oe.on_idle(now, SessionId(fd), &mut self.reply);
                     if n > 0 {
-                        let _ = client.stream.write_all(&reply[..n]);
+                        let _ = client.stream.write_all(&self.reply[..n]);
                     }
                 }
                 Err(_) => dead.push(fd),

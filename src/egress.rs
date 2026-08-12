@@ -17,6 +17,7 @@ pub struct Egress<Oe> {
     events: Arc<Spsc<Event>>,
     streams: HashMap<i32, TcpStream>,
     oe: Oe,
+    scratch: Vec<u8>,
 }
 
 impl<Oe: OrderEntry> Egress<Oe> {
@@ -25,18 +26,18 @@ impl<Oe: OrderEntry> Egress<Oe> {
             events,
             streams: HashMap::new(),
             oe,
+            scratch: vec![0; Oe::MAX_OUT],
         }
     }
 
     pub fn run(&mut self, running: &AtomicBool) {
-        let mut scratch = [0u8; 128];
         while running.load(Ordering::Relaxed) {
             let mut n = 0;
             while n < BATCH {
                 let Some(evt) = self.events.pop() else {
                     break;
                 };
-                self.send(&evt, &mut scratch);
+                self.send(&evt);
                 n += 1;
             }
             if n == 0 {
@@ -45,11 +46,11 @@ impl<Oe: OrderEntry> Egress<Oe> {
         }
     }
 
-    fn send(&mut self, evt: &Event, scratch: &mut [u8]) {
+    fn send(&mut self, evt: &Event) {
         if evt.client_fd < 0 {
             return;
         }
-        let len = self.oe.encode_event(evt, scratch);
+        let len = self.oe.encode_event(evt, &mut self.scratch);
         if len == 0 {
             return;
         }
@@ -60,7 +61,7 @@ impl<Oe: OrderEntry> Egress<Oe> {
             let dup = unsafe { libc::dup(fd) };
             unsafe { TcpStream::from_raw_fd(dup) }
         });
-        let _ = stream.write_all(&scratch[..len]);
+        let _ = stream.write_all(&self.scratch[..len]);
     }
 }
 
