@@ -20,6 +20,8 @@ ironfix-session = { version = "0.4", optional = true }
 [dev-dependencies]
 criterion = "0.8.2"
 dbn = "0.66"
+ironfix-core = "0.4"
+ironfix-tagvalue = "0.4"
 
 [[bin]]
 name = "matching-engine"
@@ -38,3 +40,8 @@ path = "examples/tape_replay.rs"
 name = "fix"
 path = "examples/fix.rs"
 required-features = ["fix", "itch"]
+
+[[test]]
+name = "fix_roundtrip"
+path = "tests/fix_roundtrip.rs"
+required-features = ["fix"]

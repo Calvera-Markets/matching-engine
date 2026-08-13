@@ -41,6 +41,10 @@ impl<Oe: OrderEntry> Ingress<Oe> {
         })
     }
 
+    pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+
     pub fn run(&mut self, running: &AtomicBool) {
         while running.load(Ordering::Relaxed) {
             self.accept_all();
