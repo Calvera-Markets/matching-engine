@@ -6,6 +6,16 @@ pub mod fix;
 pub mod itch;
 #[cfg(feature = "ouch")]
 pub mod ouch;
+#[cfg(feature = "sbe")]
+#[allow(dead_code, unused_imports)]
+pub mod sbe {
+    pub mod order_entry {
+        include!(concat!(env!("OUT_DIR"), "/order_entry.rs"));
+    }
+    pub mod market_data {
+        include!(concat!(env!("OUT_DIR"), "/market_data.rs"));
+    }
+}
 
 use std::time::Instant;
 
