@@ -7,6 +7,8 @@ pub mod itch;
 #[cfg(feature = "ouch")]
 pub mod ouch;
 #[cfg(feature = "sbe")]
+pub mod sbe_md;
+#[cfg(feature = "sbe")]
 pub mod sbe_oe;
 #[cfg(feature = "sbe")]
 #[allow(dead_code, unused_imports)]
