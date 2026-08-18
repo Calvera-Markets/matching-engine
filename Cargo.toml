@@ -45,6 +45,11 @@ name = "fix"
 path = "examples/fix.rs"
 required-features = ["fix", "itch"]
 
+[[example]]
+name = "sbe"
+path = "examples/sbe.rs"
+required-features = ["sbe"]
+
 [[test]]
 name = "fix_roundtrip"
 path = "tests/fix_roundtrip.rs"

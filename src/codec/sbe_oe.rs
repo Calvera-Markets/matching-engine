@@ -1,6 +1,7 @@
 //! SBE order-entry codec.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use ironsbe_core::header::MessageHeader;
 
@@ -14,8 +15,14 @@ use crate::codec::sbe::order_entry::Side as SbeSide;
 use crate::codec::{OrderEntry, ParseOutcome, SessionId};
 use crate::types::{Command, CommandType, Event, EventType};
 
-/// SBE order-entry adapter. `symbol` is the single instrument this book accepts.
+/// SBE order-entry adapter. Clone to share ClOrdID state across ingress and egress.
+#[derive(Clone)]
 pub struct SbeOe {
+    // TODO: consider if a ring buffer or disruptor should be used here
+    inner: Arc<Mutex<Inner>>,
+}
+
+struct Inner {
     symbol: String,
     ids: HashMap<(SessionId, String), u32>,
     refs: HashMap<(SessionId, u32), String>,
@@ -27,14 +34,19 @@ pub struct SbeOe {
 impl SbeOe {
     pub fn new(symbol: impl Into<String>) -> Self {
         Self {
-            symbol: symbol.into(),
-            ids: HashMap::new(),
-            refs: HashMap::new(),
-            last_ref: HashMap::new(),
-            next_ref: 1,
-            next_exec: 1,
+            inner: Arc::new(Mutex::new(Inner {
+                symbol: symbol.into(),
+                ids: HashMap::new(),
+                refs: HashMap::new(),
+                last_ref: HashMap::new(),
+                next_ref: 1,
+                next_exec: 1,
+            })),
         }
     }
+}
+
+impl Inner {
 
     fn pad_clord(s: &str) -> [u8; 14] {
         let mut id = [b' '; 14];
@@ -161,9 +173,7 @@ impl SbeOe {
     }
 }
 
-impl OrderEntry for SbeOe {
-    const MAX_OUT: usize = 256;
-
+impl Inner {
     fn parse(&mut self, buf: &[u8], session: SessionId, reply: &mut [u8]) -> ParseOutcome {
         if buf.len() < MessageHeader::ENCODED_LENGTH {
             return ParseOutcome::NeedMore;
@@ -331,6 +341,22 @@ impl OrderEntry for SbeOe {
         self.ids.retain(|(s, _), _| *s != session);
         self.refs.retain(|(s, _), _| *s != session);
         self.last_ref.remove(&session);
+    }
+}
+
+impl OrderEntry for SbeOe {
+    const MAX_OUT: usize = 256;
+
+    fn parse(&mut self, buf: &[u8], session: SessionId, reply: &mut [u8]) -> ParseOutcome {
+        self.inner.lock().expect("sbe").parse(buf, session, reply)
+    }
+
+    fn encode_event(&mut self, evt: &Event, out: &mut [u8]) -> usize {
+        self.inner.lock().expect("sbe").encode_event(evt, out)
+    }
+
+    fn on_session_end(&mut self, session: SessionId) {
+        self.inner.lock().expect("sbe").on_session_end(session)
     }
 }
 
