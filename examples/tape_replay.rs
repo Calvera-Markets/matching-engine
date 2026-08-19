@@ -4,15 +4,23 @@
 //!
 //!   cargo run -p matching-engine --release --example tape_replay -- --synthetic 10000000
 //!   cargo run -p matching-engine --release --example tape_replay -- --tape FILE --no-wal
+//!   cargo run -p matching-engine --release --example tape_replay -- --synthetic 10000000 --no-wal --codec ouch
+//!   cargo run -p matching-engine --release --example tape_replay --features fix -- --synthetic 10000000 --no-wal --codec fix
+//!   cargo run -p matching-engine --release --example tape_replay --features sbe -- --synthetic 10000000 --no-wal --codec sbe
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use calvera_books::{Price, Side};
+use matching_engine::codec::itch::Packet;
+use matching_engine::codec::ouch::{self, Ouch};
+use matching_engine::codec::{MarketData, OrderEntry};
+#[cfg(any(feature = "fix", feature = "sbe"))]
+use matching_engine::codec::{ParseOutcome, SessionId};
 use matching_engine::engine::MatchingEngine;
 use matching_engine::spsc::Spsc;
-use matching_engine::types::{Command, CommandType};
+use matching_engine::types::{Command, CommandType, Event};
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -138,13 +146,57 @@ fn load_dbn(path: &Path) -> Vec<TapeOp> {
     ops
 }
 
-fn parse_args() -> (Option<PathBuf>, Option<usize>, usize, usize, bool, bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Codec {
+    None,
+    Ouch,
+    #[cfg(feature = "fix")]
+    Fix,
+    #[cfg(feature = "sbe")]
+    Sbe,
+}
+
+fn parse_codec(s: &str) -> Codec {
+    match s {
+        "none" => Codec::None,
+        "ouch" => Codec::Ouch,
+        "fix" => {
+            #[cfg(feature = "fix")]
+            {
+                return Codec::Fix;
+            }
+            #[cfg(not(feature = "fix"))]
+            {
+                eprintln!("rebuild with --features fix");
+                std::process::exit(2);
+            }
+        }
+        "sbe" => {
+            #[cfg(feature = "sbe")]
+            {
+                return Codec::Sbe;
+            }
+            #[cfg(not(feature = "sbe"))]
+            {
+                eprintln!("rebuild with --features sbe");
+                std::process::exit(2);
+            }
+        }
+        other => {
+            eprintln!("unknown --codec {other} (none|ouch|fix|sbe)");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_args() -> (Option<PathBuf>, Option<usize>, usize, usize, bool, bool, Codec) {
     let mut tape = std::env::var_os("TAPE").map(PathBuf::from);
     let mut synthetic = None;
     let mut slab = 200_000usize;
     let mut warmup = 100_000usize;
     let mut wal = true;
     let mut latency = true;
+    let mut codec = Codec::None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut take = || args.next().expect("flag needs a value");
@@ -155,9 +207,11 @@ fn parse_args() -> (Option<PathBuf>, Option<usize>, usize, usize, bool, bool) {
             "--warmup" => warmup = take().parse().unwrap(),
             "--no-wal" => wal = false,
             "--no-latency" => latency = false,
+            "--codec" => codec = parse_codec(&take()),
             "-h" | "--help" => {
                 eprintln!(
-                    "tape_replay --synthetic N | --tape FILE [--slab N] [--warmup N] [--no-wal] [--no-latency]"
+                    "tape_replay --synthetic N | --tape FILE [--slab N] [--warmup N]\n\
+                     [--no-wal] [--no-latency] [--codec none|ouch|fix|sbe]"
                 );
                 std::process::exit(0);
             }
@@ -167,11 +221,11 @@ fn parse_args() -> (Option<PathBuf>, Option<usize>, usize, usize, bool, bool) {
             }
         }
     }
-    (tape, synthetic, slab, warmup, wal, latency)
+    (tape, synthetic, slab, warmup, wal, latency, codec)
 }
 
 fn main() {
-    let (tape, synth_n, slab, warmup, wal_on, latency) = parse_args();
+    let (tape, synth_n, slab, warmup, wal_on, latency, codec) = parse_args();
     let ops = if let Some(n) = synth_n {
         synthetic(n)
     } else if let Some(p) = tape {
@@ -180,7 +234,22 @@ fn main() {
         eprintln!("--synthetic N or --tape FILE");
         std::process::exit(2);
     };
-    println!("ops={}  slab={}  wal={}  warmup={}", ops.len(), slab, wal_on, warmup);
+    let codec_name = match codec {
+        Codec::None => "none",
+        Codec::Ouch => "ouch+itch",
+        #[cfg(feature = "fix")]
+        Codec::Fix => "fix+itch",
+        #[cfg(feature = "sbe")]
+        Codec::Sbe => "sbe",
+    };
+    println!(
+        "ops={}  slab={}  wal={}  warmup={}  codec={}",
+        ops.len(),
+        slab,
+        wal_on,
+        warmup,
+        codec_name
+    );
 
     let wal_path = std::env::temp_dir().join(format!("me-tape-{}.wal", std::process::id()));
     let wal_bytes = if wal_on {
@@ -189,12 +258,55 @@ fn main() {
         64 * 1024
     };
     let cmds = Arc::new(Spsc::new(16));
-    let ouch = Arc::new(Spsc::new(1 << 16));
-    let itch = Arc::new(Spsc::new(1 << 16));
-    let mut eng = MatchingEngine::with_wal_size(cmds, ouch, itch, &wal_path, slab, wal_bytes)
-        .expect("engine");
+    let private = Arc::new(Spsc::new(1 << 16));
+    let public = Arc::new(Spsc::new(1 << 16));
+    let mut eng = MatchingEngine::with_wal_size(
+        cmds,
+        private.clone(),
+        public.clone(),
+        &wal_path,
+        slab,
+        wal_bytes,
+    )
+    .expect("engine");
     eng.set_wal(wal_on);
 
+    match codec {
+        Codec::None => run_none(&ops, warmup, latency, &mut eng),
+        Codec::Ouch => run_ouch(&ops, warmup, latency, &mut eng, &private, &public),
+        #[cfg(feature = "fix")]
+        Codec::Fix => run_fix(&ops, warmup, latency, &mut eng, &private, &public),
+        #[cfg(feature = "sbe")]
+        Codec::Sbe => run_sbe(&ops, warmup, latency, &mut eng, &private, &public),
+    }
+
+    let _ = std::fs::remove_file(wal_path);
+}
+
+fn report(n: usize, dt: f64, samples: &[u32]) {
+    let n = n as f64;
+    println!(
+        "throughput  {:.2} M ops/s   {:.2} ns/op   wall {:.3}s",
+        n / dt / 1e6,
+        dt * 1e9 / n,
+        dt
+    );
+    if samples.is_empty() {
+        return;
+    }
+    let mut s = samples.to_vec();
+    s.sort_unstable();
+    let p = |q: f64| s[((s.len() as f64 * q) as usize).min(s.len() - 1)];
+    println!(
+        "latency     p50 {} ns   p99 {} ns   p99.9 {} ns   max {} ns",
+        p(0.50),
+        p(0.99),
+        p(0.999),
+        s[s.len() - 1]
+    );
+}
+
+fn warmup_reset(eng: &mut MatchingEngine, ops: &[TapeOp], warmup: usize) {
     let warm = warmup.min(ops.len());
     for op in &ops[..warm] {
         eng.step(&to_cmd(op));
@@ -203,16 +315,38 @@ fn main() {
     eng.step(&Command::reset());
     eng.drain_events();
     println!("warmup {warm} + reset");
+}
 
+fn publish(
+    private: &Spsc<Event>,
+    public: &Spsc<Event>,
+    oe: &mut impl OrderEntry,
+    md: &mut impl MarketData,
+    scratch: &mut [u8],
+) {
+    while let Some(ev) = private.pop() {
+        let _ = oe.encode_event(&ev, scratch);
+    }
+    while let Some(ev) = public.pop() {
+        if !md.push(&ev) {
+            let _ = md.take();
+            let _ = md.push(&ev);
+        }
+    }
+    let _ = md.take();
+}
+
+fn run_none(ops: &[TapeOp], warmup: usize, latency: bool, eng: &mut MatchingEngine) {
+    warmup_reset(eng, ops, warmup);
     let mut samples = if latency {
         Vec::with_capacity(ops.len())
     } else {
         Vec::new()
     };
     let t0 = Instant::now();
-    if latency {
-        for op in &ops {
-            let c = to_cmd(op);
+    for op in ops {
+        let c = to_cmd(op);
+        if latency {
             let a = Instant::now();
             eng.step(&c);
             let ns = a.elapsed().as_nanos() as u64;
@@ -220,33 +354,283 @@ fn main() {
             if ns > 0 {
                 samples.push(ns.min(u32::MAX as u64) as u32);
             }
-        }
-    } else {
-        for op in &ops {
-            eng.step(&to_cmd(op));
+        } else {
+            eng.step(&c);
             eng.drain_events();
         }
     }
-    let dt = t0.elapsed().as_secs_f64().max(1e-12);
-    let n = ops.len() as f64;
-    println!(
-        "throughput  {:.2} M ops/s   {:.2} ns/op   wall {:.3}s",
-        n / dt / 1e6,
-        dt * 1e9 / n,
-        dt
-    );
+    report(ops.len(), t0.elapsed().as_secs_f64().max(1e-12), &samples);
+}
 
-    if !samples.is_empty() {
-        samples.sort_unstable();
-        let p = |q: f64| samples[((samples.len() as f64 * q) as usize).min(samples.len() - 1)];
-        println!(
-            "latency     p50 {} ns   p99 {} ns   p99.9 {} ns   max {} ns",
-            p(0.50),
-            p(0.99),
-            p(0.999),
-            samples[samples.len() - 1]
-        );
+fn run_ouch(
+    ops: &[TapeOp],
+    warmup: usize,
+    latency: bool,
+    eng: &mut MatchingEngine,
+    private: &Spsc<Event>,
+    public: &Spsc<Event>,
+) {
+    warmup_reset(eng, ops, warmup);
+    let mut oe = Ouch;
+    let mut md = Packet::new();
+    let mut scratch = vec![0u8; Ouch::MAX_OUT];
+    let mut wire = [0u8; 64];
+    let mut samples = if latency {
+        Vec::with_capacity(ops.len())
+    } else {
+        Vec::new()
+    };
+    let t0 = Instant::now();
+    for op in ops {
+        if latency {
+            let a = Instant::now();
+            let n = encode_ouch(op, &mut wire);
+            let cmd = match ouch::parse(&wire[..n], 1) {
+                Some((c, _)) => c,
+                None => panic!("ouch parse"),
+            };
+            eng.step(&cmd);
+            publish(private, public, &mut oe, &mut md, &mut scratch);
+            let ns = a.elapsed().as_nanos() as u64;
+            if ns > 0 {
+                samples.push(ns.min(u32::MAX as u64) as u32);
+            }
+        } else {
+            let n = encode_ouch(op, &mut wire);
+            let cmd = ouch::parse(&wire[..n], 1).expect("ouch").0;
+            eng.step(&cmd);
+            publish(private, public, &mut oe, &mut md, &mut scratch);
+        }
     }
+    report(ops.len(), t0.elapsed().as_secs_f64().max(1e-12), &samples);
+}
 
-    let _ = std::fs::remove_file(wal_path);
+fn encode_ouch(op: &TapeOp, out: &mut [u8]) -> usize {
+    let uref = (op.id as u32).to_be_bytes();
+    match op.action {
+        Action::Add => {
+            out[..ouch::ENTER_LEN].fill(0);
+            out[0] = ouch::ENTER;
+            out[1..5].copy_from_slice(&uref);
+            out[5] = if op.side == Side::Bid { b'B' } else { b'S' };
+            out[6..10].copy_from_slice(&(op.qty as u32).to_be_bytes());
+            out[18..26].copy_from_slice(&op.price.0.to_be_bytes());
+            out[31..45].fill(b' ');
+            ouch::ENTER_LEN
+        }
+        Action::Cancel => {
+            out[0] = ouch::CANCEL;
+            out[1..5].copy_from_slice(&uref);
+            out[5..9].copy_from_slice(&(op.qty as u32).to_be_bytes());
+            ouch::CANCEL_LEN
+        }
+        Action::Modify => {
+            out[0] = ouch::MODIFY;
+            out[1..5].copy_from_slice(&uref);
+            out[5] = if op.side == Side::Bid { b'B' } else { b'S' };
+            out[6..10].copy_from_slice(&(op.qty as u32).to_be_bytes());
+            ouch::MODIFY_LEN
+        }
+    }
+}
+
+#[cfg(feature = "fix")]
+fn run_fix(
+    ops: &[TapeOp],
+    warmup: usize,
+    latency: bool,
+    eng: &mut MatchingEngine,
+    private: &Spsc<Event>,
+    public: &Spsc<Event>,
+) {
+    use ironfix_tagvalue::Encoder;
+    use matching_engine::codec::fix::Fix;
+
+    warmup_reset(eng, ops, warmup);
+    let mut oe = Fix::new("VENUE", "CLIENT", "AAPL");
+    let mut md = Packet::new();
+    let mut scratch = vec![0u8; Fix::MAX_OUT];
+    let mut reply = vec![0u8; Fix::MAX_OUT];
+    let sid = SessionId(1);
+    {
+        let mut enc = Encoder::new("FIX.4.4");
+        enc.put_str(35, "A");
+        enc.put_str(49, "CLIENT");
+        enc.put_str(56, "VENUE");
+        enc.put_int(34, 1);
+        enc.put_int(98, 0);
+        enc.put_int(108, 0);
+        let logon = enc.finish().expect("logon").to_vec();
+        assert!(matches!(
+            oe.parse(&logon, sid, &mut reply),
+            ParseOutcome::Reply { .. }
+        ));
+    }
+    let mut seq = 2i64;
+    let mut samples = if latency {
+        Vec::with_capacity(ops.len())
+    } else {
+        Vec::new()
+    };
+    let t0 = Instant::now();
+    for op in ops {
+        if latency {
+            let a = Instant::now();
+            let wire = encode_fix(op, seq);
+            seq += 1;
+            let cmd = match oe.parse(&wire, sid, &mut reply) {
+                ParseOutcome::Command { cmd, .. } => cmd,
+                _ => panic!("fix parse"),
+            };
+            eng.step(&cmd);
+            publish(private, public, &mut oe, &mut md, &mut scratch);
+            let ns = a.elapsed().as_nanos() as u64;
+            if ns > 0 {
+                samples.push(ns.min(u32::MAX as u64) as u32);
+            }
+        } else {
+            let wire = encode_fix(op, seq);
+            seq += 1;
+            let cmd = match oe.parse(&wire, sid, &mut reply) {
+                ParseOutcome::Command { cmd, .. } => cmd,
+                _ => panic!("fix parse"),
+            };
+            eng.step(&cmd);
+            publish(private, public, &mut oe, &mut md, &mut scratch);
+        }
+    }
+    report(ops.len(), t0.elapsed().as_secs_f64().max(1e-12), &samples);
+}
+
+#[cfg(feature = "fix")]
+fn encode_fix(op: &TapeOp, seq: i64) -> Vec<u8> {
+    use ironfix_tagvalue::Encoder;
+    let id = op.id.to_string();
+    let mut enc = Encoder::new("FIX.4.4");
+    match op.action {
+        Action::Add => {
+            enc.put_str(35, "D");
+            enc.put_str(49, "CLIENT");
+            enc.put_str(56, "VENUE");
+            enc.put_int(34, seq);
+            enc.put_str(11, &id);
+            enc.put_str(55, "AAPL");
+            enc.put_str(54, if op.side == Side::Bid { "1" } else { "2" });
+            enc.put_str(38, &op.qty.to_string());
+            enc.put_str(44, &op.price.0.to_string());
+        }
+        Action::Cancel => {
+            enc.put_str(35, "F");
+            enc.put_str(49, "CLIENT");
+            enc.put_str(56, "VENUE");
+            enc.put_int(34, seq);
+            enc.put_str(11, &format!("C{id}"));
+            enc.put_str(41, &id);
+            enc.put_str(55, "AAPL");
+        }
+        Action::Modify => {
+            enc.put_str(35, "G");
+            enc.put_str(49, "CLIENT");
+            enc.put_str(56, "VENUE");
+            enc.put_int(34, seq);
+            enc.put_str(11, &id);
+            enc.put_str(41, &id);
+            enc.put_str(55, "AAPL");
+            enc.put_str(54, if op.side == Side::Bid { "1" } else { "2" });
+            enc.put_str(38, &op.qty.to_string());
+            enc.put_str(44, &op.price.0.to_string());
+        }
+    }
+    enc.finish().expect("fix").to_vec()
+}
+
+#[cfg(feature = "sbe")]
+fn run_sbe(
+    ops: &[TapeOp],
+    warmup: usize,
+    latency: bool,
+    eng: &mut MatchingEngine,
+    private: &Spsc<Event>,
+    public: &Spsc<Event>,
+) {
+    use matching_engine::codec::sbe_md::SbeMd;
+    use matching_engine::codec::sbe_oe::SbeOe;
+
+    warmup_reset(eng, ops, warmup);
+    let mut oe = SbeOe::new("AAPL");
+    let mut md = SbeMd::new(b"AAPL");
+    let mut scratch = vec![0u8; SbeOe::MAX_OUT];
+    let mut reply = vec![0u8; SbeOe::MAX_OUT];
+    let mut wire = vec![0u8; 128];
+    let sid = SessionId(1);
+    let mut samples = if latency {
+        Vec::with_capacity(ops.len())
+    } else {
+        Vec::new()
+    };
+    let t0 = Instant::now();
+    for op in ops {
+        if latency {
+            let a = Instant::now();
+            let n = encode_sbe(op, &mut wire);
+            let cmd = match oe.parse(&wire[..n], sid, &mut reply) {
+                ParseOutcome::Command { cmd, .. } => cmd,
+                _ => panic!("sbe parse"),
+            };
+            eng.step(&cmd);
+            publish(private, public, &mut oe, &mut md, &mut scratch);
+            let ns = a.elapsed().as_nanos() as u64;
+            if ns > 0 {
+                samples.push(ns.min(u32::MAX as u64) as u32);
+            }
+        } else {
+            let n = encode_sbe(op, &mut wire);
+            let cmd = match oe.parse(&wire[..n], sid, &mut reply) {
+                ParseOutcome::Command { cmd, .. } => cmd,
+                _ => panic!("sbe parse"),
+            };
+            eng.step(&cmd);
+            publish(private, public, &mut oe, &mut md, &mut scratch);
+        }
+    }
+    report(ops.len(), t0.elapsed().as_secs_f64().max(1e-12), &samples);
+}
+
+#[cfg(feature = "sbe")]
+fn encode_sbe(op: &TapeOp, out: &mut [u8]) -> usize {
+    use matching_engine::codec::sbe::order_entry::{
+        NewOrderSingleEncoder, OrderCancelReplaceRequestEncoder, OrderCancelRequestEncoder,
+        Side as SbeSide,
+    };
+    let user_ref = op.id as u32;
+    let side = if op.side == Side::Bid {
+        SbeSide::Buy
+    } else {
+        SbeSide::Sell
+    };
+    match op.action {
+        Action::Add => {
+            let mut enc = NewOrderSingleEncoder::wrap(out, 0);
+            enc.set_user_ref(user_ref);
+            enc.set_symbol(b"AAPL");
+            enc.set_side(side);
+            enc.set_price(op.price.0 as i64);
+            enc.set_quantity(op.qty);
+            enc.encoded_length()
+        }
+        Action::Cancel => {
+            let mut enc = OrderCancelRequestEncoder::wrap(out, 0);
+            enc.set_user_ref(user_ref);
+            enc.set_quantity(op.qty);
+            enc.encoded_length()
+        }
+        Action::Modify => {
+            let mut enc = OrderCancelReplaceRequestEncoder::wrap(out, 0);
+            enc.set_user_ref(user_ref);
+            enc.set_side(side);
+            enc.set_price(op.price.0 as i64);
+            enc.set_quantity(op.qty);
+            enc.encoded_length()
+        }
+    }
 }

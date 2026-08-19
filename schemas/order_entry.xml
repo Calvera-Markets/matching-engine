@@ -19,15 +19,15 @@
             <validValue name="Sell">2</validValue>
         </enum>
 
-        <enum name="ExecType" encodingType="char">
+        <enum name="ExecType" encodingType="uint8">
             <validValue name="New">0</validValue>
             <validValue name="Canceled">4</validValue>
             <validValue name="Replaced">5</validValue>
             <validValue name="Rejected">8</validValue>
-            <validValue name="Trade">F</validValue>
+            <validValue name="Trade">10</validValue>
         </enum>
 
-        <enum name="OrdStatus" encodingType="char">
+        <enum name="OrdStatus" encodingType="uint8">
             <validValue name="New">0</validValue>
             <validValue name="PartialFill">1</validValue>
             <validValue name="Canceled">4</validValue>
@@ -35,51 +35,45 @@
             <validValue name="Rejected">8</validValue>
         </enum>
 
-        <type name="ClOrdId" primitiveType="char" length="20"/>
         <type name="Symbol" primitiveType="char" length="8"/>
-        <type name="ExecId" primitiveType="char" length="20"/>
     </types>
 
-    <sbe:message name="NewOrderSingle" id="1" blockLength="48">
-        <field name="clOrdId" id="11" type="ClOrdId" offset="0"/>
-        <field name="symbol" id="55" type="Symbol" offset="20"/>
-        <field name="side" id="54" type="Side" offset="28"/>
-        <field name="price" id="44" type="int64" offset="32"/>
-        <field name="quantity" id="38" type="uint64" offset="40"/>
+    <sbe:message name="NewOrderSingle" id="1" blockLength="32">
+        <field name="userRef" id="11" type="uint32" offset="0"/>
+        <field name="side" id="54" type="Side" offset="4"/>
+        <field name="symbol" id="55" type="Symbol" offset="8"/>
+        <field name="price" id="44" type="int64" offset="16"/>
+        <field name="quantity" id="38" type="uint64" offset="24"/>
     </sbe:message>
 
-    <sbe:message name="OrderCancelRequest" id="2" blockLength="56">
-        <field name="clOrdId" id="11" type="ClOrdId" offset="0"/>
-        <field name="origClOrdId" id="41" type="ClOrdId" offset="20"/>
-        <field name="symbol" id="55" type="Symbol" offset="40"/>
-        <field name="quantity" id="38" type="uint64" offset="48"/>
+    <sbe:message name="OrderCancelRequest" id="2" blockLength="16">
+        <field name="userRef" id="11" type="uint32" offset="0"/>
+        <field name="quantity" id="38" type="uint64" offset="8"/>
     </sbe:message>
 
-    <sbe:message name="OrderCancelReplaceRequest" id="3" blockLength="72">
-        <field name="clOrdId" id="11" type="ClOrdId" offset="0"/>
-        <field name="origClOrdId" id="41" type="ClOrdId" offset="20"/>
-        <field name="symbol" id="55" type="Symbol" offset="40"/>
-        <field name="side" id="54" type="Side" offset="48"/>
-        <field name="price" id="44" type="int64" offset="56"/>
-        <field name="quantity" id="38" type="uint64" offset="64"/>
+    <sbe:message name="OrderCancelReplaceRequest" id="3" blockLength="24">
+        <field name="userRef" id="11" type="uint32" offset="0"/>
+        <field name="side" id="54" type="Side" offset="4"/>
+        <field name="price" id="44" type="int64" offset="8"/>
+        <field name="quantity" id="38" type="uint64" offset="16"/>
     </sbe:message>
 
-    <sbe:message name="ExecutionReport" id="8" blockLength="96">
-        <field name="clOrdId" id="11" type="ClOrdId" offset="0"/>
-        <field name="execId" id="17" type="ExecId" offset="20"/>
-        <field name="symbol" id="55" type="Symbol" offset="40"/>
-        <field name="side" id="54" type="Side" offset="48"/>
-        <field name="execType" id="150" type="ExecType" offset="49"/>
-        <field name="ordStatus" id="39" type="OrdStatus" offset="50"/>
-        <field name="price" id="44" type="int64" offset="56"/>
-        <field name="quantity" id="38" type="uint64" offset="64"/>
-        <field name="lastPx" id="31" type="int64" offset="72"/>
-        <field name="lastQty" id="32" type="uint64" offset="80"/>
-        <field name="orderId" id="37" type="uint64" offset="88"/>
+    <sbe:message name="ExecutionReport" id="8" blockLength="64">
+        <field name="userRef" id="11" type="uint32" offset="0"/>
+        <field name="side" id="54" type="Side" offset="4"/>
+        <field name="execType" id="150" type="ExecType" offset="5"/>
+        <field name="ordStatus" id="39" type="OrdStatus" offset="6"/>
+        <field name="execId" id="17" type="uint64" offset="8"/>
+        <field name="orderId" id="37" type="uint64" offset="16"/>
+        <field name="price" id="44" type="int64" offset="24"/>
+        <field name="quantity" id="38" type="uint64" offset="32"/>
+        <field name="lastPx" id="31" type="int64" offset="40"/>
+        <field name="lastQty" id="32" type="uint64" offset="48"/>
+        <field name="symbol" id="55" type="Symbol" offset="56"/>
     </sbe:message>
 
-    <sbe:message name="Reject" id="9" blockLength="24">
-        <field name="clOrdId" id="11" type="ClOrdId" offset="0"/>
-        <field name="reason" id="103" type="uint16" offset="20"/>
+    <sbe:message name="Reject" id="9" blockLength="8">
+        <field name="userRef" id="11" type="uint32" offset="0"/>
+        <field name="reason" id="103" type="uint16" offset="4"/>
     </sbe:message>
 </sbe:messageSchema>
