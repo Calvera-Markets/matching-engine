@@ -14,8 +14,6 @@ Order-entry and market-data are chosen at **compile time** (`Ingress<Oe>`, `Egre
 
 The book uses handles. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. There is no fsync on the WAL.
 
-See [docs/spsc-vs-disruptor.md](docs/spsc-vs-disruptor.md) for why the rings are SPSC, not a Disruptor.
-
 ## Features
 
 | feature | role | crate |
