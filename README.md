@@ -1,18 +1,20 @@
 # Matching Engine
 
-Exchange matching engine with 4 threads, 3 SPSC rings, WAL before apply.
+Exchange matching engine with a compile-time swappable wire protocol (OUCH, ITCH, FIX, and SBE). It runs on 4 threads and 3 SPSC rings, and writes the WAL before it applies the order.
+
+The flow is the following:
 
 ```
 TCP (OE)  →  ingress  →  Command SPSC  →  engine (WAL + book)  →  Event SPSC  →  egress (private ack)
                                                                 ↳  Event SPSC  →  MD / multicast
 ```
 
-Order-entry and market-data are chosen at **compile time** (`Ingress<Oe>`, `Egress<Oe>`, `MdPub<Md>`). The default binary is OUCH + ITCH. FIX and SBE are feature-gated examples.
+Order-entry and market-data are chosen at compile time (`Ingress<Oe>`, `Egress<Oe>`, `MdPub<Md>`). The default binary is OUCH + ITCH. FIX and SBE are feature-gated.
 
 - Private egress: ack to whoever sent the order.
 - Public tape: a separate queue, so a slow multicast reader cannot stall.
 
-The book uses handles. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. There is no fsync on the WAL.
+The book gives each resting order a handle, and cancels, fills, and acks refer to that order by the handle. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. The WAL write is a store into the mmap, with no fsync, so the engine thread does not wait on disk. A power loss can drop the tail the kernel has not flushed.
 
 ## Features
 
@@ -25,16 +27,9 @@ The book uses handles. The engine maps `(client_fd, user_ref)` and turns fills i
 
 SBE identity on the wire is numeric `userRef` (OUCH-class). FIX identity is ClOrdID (string table + mutex on the adapter).
 
-```sh
-# default: OUCH in, ITCH out
-cargo run -p matching-engine --release -- --port 12345 --wal orderbook.wal
+## Running
 
-# FIX 4.4 in, ITCH out
-cargo run -p matching-engine --release --example fix --features fix
-
-# SBE in, SBE out
-cargo run -p matching-engine --release --example sbe --features sbe
-```
+`just` lists the commands. `just run` is OUCH in and ITCH out, `just fix` is FIX in and ITCH out, and `just sbe` is SBE in and out. `just test`, `just test-fix`, and `just test-sbe` are the three test sets.
 
 Cores default to 8 / 10 / 12 / 14 (`--cpu-ingress` and friends). Pinning is Linux-only.
 
@@ -42,22 +37,7 @@ Cores default to 8 / 10 / 12 / 14 (`--cpu-ingress` and friends). Pinning is Linu
 
 Same A/C/M stream as the book, but each op is `MatchingEngine::step`. `--codec` encodes each op, runs the engine, then drains private + public rings through the order-entry and market-data codecs.
 
-```sh
-cargo test -p matching-engine
-cargo test -p matching-engine --features fix
-cargo test -p matching-engine --features sbe
-cargo run -p matching-engine --release --example tape_replay -- \
-  --synthetic 10000000 --no-latency
-cargo run -p matching-engine --release --example tape_replay -- \
-  --synthetic 10000000 --no-wal --no-latency
-cargo run -p matching-engine --release --example tape_replay -- \
-  --synthetic 10000000 --no-wal --no-latency --codec ouch
-cargo run -p matching-engine --release --example tape_replay --features sbe -- \
-  --synthetic 10000000 --no-wal --no-latency --codec sbe
-cargo run -p matching-engine --release --example tape_replay --features fix -- \
-  --synthetic 10000000 --no-wal --no-latency --codec fix
-cargo bench -p matching-engine --bench hot
-```
+`just tape` is the 10M synthetic run with the WAL on. `just tape --no-wal` turns the WAL off, and `just tape --no-wal --codec ouch` adds the OUCH and ITCH codec. `just tape-sbe` and `just tape-fix` are the WAL-off SBE and FIX runs. `just bench` is the hot-path bench.
 
 On Apple Silicon, 10M synthetic rest/cancel/modify, `--no-latency`:
 
