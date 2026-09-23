@@ -11,7 +11,7 @@ fix = ["dep:ironfix-core", "dep:ironfix-tagvalue", "dep:ironfix-session"]
 sbe = ["dep:ironsbe-core", "dep:ironsbe-codegen"]
 
 [dependencies]
-calvera-books = { workspace = true }
+calvera-books = { git = "https://github.com/Calvera-Markets/orderbook.git", branch = "main" }
 libc = "0.2"
 ironfix-core = { version = "0.4", optional = true }
 ironfix-tagvalue = { version = "0.4", optional = true }

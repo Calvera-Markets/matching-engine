@@ -46,8 +46,6 @@ Same A/C/M stream as the book, but each op is `MatchingEngine::step`. `--codec` 
 cargo test -p matching-engine
 cargo test -p matching-engine --features fix
 cargo test -p matching-engine --features sbe
-cargo run -p calvera-books --release --example tape_replay -- \
-  --synthetic 10000000 --no-latency
 cargo run -p matching-engine --release --example tape_replay -- \
   --synthetic 10000000 --no-latency
 cargo run -p matching-engine --release --example tape_replay -- \
