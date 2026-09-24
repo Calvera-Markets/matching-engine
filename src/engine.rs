@@ -1,6 +1,7 @@
 //! Matching engine hot loop: pop Command → WAL → book → push Events.
 
 use std::collections::HashMap;
+use std::mem;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,7 +184,8 @@ impl MatchingEngine {
     }
 
     fn publish_fills(&mut self, taker: &Command) -> u64 {
-        let fills: Vec<_> = self.book.consumer.fills.drain(..).collect();
+        // Move the fill buffer out, then put the empty buffer back so the next match keeps its capacity.
+        let mut fills = mem::take(&mut self.book.consumer.fills);
         let mut filled = 0u64;
         for fill in &fills {
             filled += fill.quantity;
@@ -231,6 +233,8 @@ impl MatchingEngine {
                 },
             );
         }
+        fills.clear();
+        self.book.consumer.fills = fills;
         filled
     }
 
