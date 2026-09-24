@@ -2,9 +2,9 @@
 
 use calvera_books::Side;
 
-use crate::codec::sbe::market_data::{AddEncoder, DeleteEncoder, ExecuteEncoder};
-use crate::codec::sbe::market_data::Side as SbeSide;
 use crate::codec::MarketData;
+use crate::codec::sbe::market_data::Side as SbeSide;
+use crate::codec::sbe::market_data::{AddEncoder, DeleteEncoder, ExecuteEncoder};
 use crate::types::{Event, EventType};
 
 const CAP: usize = 64;

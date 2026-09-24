@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -88,8 +88,9 @@ fn read_fix(stream: &mut TcpStream, acc: &mut Vec<u8>) -> Vec<u8> {
         match stream.read(&mut tmp) {
             Ok(0) => panic!("eof"),
             Ok(n) => acc.extend_from_slice(&tmp[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 thread::sleep(Duration::from_millis(1));
                 continue;

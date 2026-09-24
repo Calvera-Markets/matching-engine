@@ -75,9 +75,24 @@ fn synthetic(n: usize) -> Vec<TapeOp> {
     for i in 0..seed {
         let side = if i % 2 == 0 { Side::Bid } else { Side::Ask };
         let off = (i as u64 / 2) % SPREAD + 1;
-        let price = Price(if side == Side::Bid { MID - off } else { MID + off });
-        live.push(Live { id: next_id, side, price, qty: 1 });
-        ops.push(TapeOp { action: Action::Add, id: next_id, side, price, qty: 1 });
+        let price = Price(if side == Side::Bid {
+            MID - off
+        } else {
+            MID + off
+        });
+        live.push(Live {
+            id: next_id,
+            side,
+            price,
+            qty: 1,
+        });
+        ops.push(TapeOp {
+            action: Action::Add,
+            id: next_id,
+            side,
+            price,
+            qty: 1,
+        });
         next_id += 1;
     }
     while ops.len() < n {
@@ -88,23 +103,58 @@ fn synthetic(n: usize) -> Vec<TapeOp> {
         if force_cancel || (!force_add && !live.is_empty() && roll < 45) {
             let i = (next() as usize) % live.len();
             let g = live.swap_remove(i);
-            ops.push(TapeOp { action: Action::Cancel, id: g.id, side: g.side, price: g.price, qty: g.qty });
+            ops.push(TapeOp {
+                action: Action::Cancel,
+                id: g.id,
+                side: g.side,
+                price: g.price,
+                qty: g.qty,
+            });
         } else if !force_add && !live.is_empty() && roll < 55 {
             let i = (next() as usize) % live.len();
             let qty = (next() % 4) + 1;
             let off = (next() % SPREAD) + 1;
             let side = live[i].side;
-            let price = Price(if side == Side::Bid { MID - off } else { MID + off });
+            let price = Price(if side == Side::Bid {
+                MID - off
+            } else {
+                MID + off
+            });
             live[i].price = price;
             live[i].qty = qty;
-            ops.push(TapeOp { action: Action::Modify, id: live[i].id, side, price, qty });
+            ops.push(TapeOp {
+                action: Action::Modify,
+                id: live[i].id,
+                side,
+                price,
+                qty,
+            });
         } else {
-            let side = if next() % 2 == 0 { Side::Bid } else { Side::Ask };
+            let side = if next() % 2 == 0 {
+                Side::Bid
+            } else {
+                Side::Ask
+            };
             let off = (next() % SPREAD) + 1;
-            let price = Price(if side == Side::Bid { MID - off } else { MID + off });
+            let price = Price(if side == Side::Bid {
+                MID - off
+            } else {
+                MID + off
+            });
             let qty = (next() % 4) + 1;
-            live.push(Live { id: next_id, side, price, qty });
-            ops.push(TapeOp { action: Action::Add, id: next_id, side, price, qty });
+            live.push(Live {
+                id: next_id,
+                side,
+                price,
+                qty,
+            });
+            ops.push(TapeOp {
+                action: Action::Add,
+                id: next_id,
+                side,
+                price,
+                qty,
+            });
             next_id += 1;
         }
     }
@@ -112,15 +162,17 @@ fn synthetic(n: usize) -> Vec<TapeOp> {
 }
 
 fn load_dbn(path: &Path) -> Vec<TapeOp> {
-    use dbn::decode::{DbnDecoder, DecodeRecordRef};
     use dbn::MboMsg;
+    use dbn::decode::{DbnDecoder, DecodeRecordRef};
     let mut dec = DbnDecoder::from_zstd_file(path).unwrap_or_else(|e| {
         eprintln!("{}: {e}", path.display());
         std::process::exit(2);
     });
     let mut ops = Vec::with_capacity(20_000_000);
     while let Some(rec) = dec.decode_record_ref().unwrap() {
-        let Some(m) = rec.get::<MboMsg>() else { continue };
+        let Some(m) = rec.get::<MboMsg>() else {
+            continue;
+        };
         let action = match m.action as u8 {
             b'A' => Action::Add,
             b'C' => Action::Cancel,
@@ -189,7 +241,15 @@ fn parse_codec(s: &str) -> Codec {
     }
 }
 
-fn parse_args() -> (Option<PathBuf>, Option<usize>, usize, usize, bool, bool, Codec) {
+fn parse_args() -> (
+    Option<PathBuf>,
+    Option<usize>,
+    usize,
+    usize,
+    bool,
+    bool,
+    Codec,
+) {
     let mut tape = std::env::var_os("TAPE").map(PathBuf::from);
     let mut synthetic = None;
     let mut slab = 200_000usize;

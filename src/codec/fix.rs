@@ -86,14 +86,11 @@ impl Fix {
 }
 
 impl Inner {
-
     fn clord_of(&self, sid: SessionId, uref: u32, fallback: &[u8; 14]) -> String {
         if let Some(s) = self.refs.get(&(sid, uref)) {
             return s.clone();
         }
-        String::from_utf8_lossy(fallback)
-            .trim()
-            .to_string()
+        String::from_utf8_lossy(fallback).trim().to_string()
     }
 
     fn trade_uref(&self, sid: SessionId, evt: &Event) -> u32 {
@@ -282,10 +279,7 @@ impl Inner {
         if let Some(sess) = self.sessions.get_mut(&session) {
             sess.next_out = seq_out + 1;
         }
-        ParseOutcome::Reply {
-            bytes: n,
-            consumed,
-        }
+        ParseOutcome::Reply { bytes: n, consumed }
     }
 
     fn map_app(
@@ -343,12 +337,19 @@ impl Inner {
         Ok(cmd)
     }
 
-    fn cmd_cancel(&mut self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, &'static str> {
+    fn cmd_cancel(
+        &mut self,
+        session: SessionId,
+        msg: &RawMessage<'_>,
+    ) -> Result<Command, &'static str> {
         let orig = msg
             .get_field_str(TAG_ORIG_CLORD)
             .or_else(|| msg.get_field_str(TAG_CLORD))
             .ok_or("fields")?;
-        let user_ref = *self.ids.get(&(session, orig.to_string())).ok_or("clordid")?;
+        let user_ref = *self
+            .ids
+            .get(&(session, orig.to_string()))
+            .ok_or("clordid")?;
         let mut cmd = Command::blank(CommandType::Cancel);
         cmd.client_fd = session.0;
         cmd.user_ref = user_ref;
@@ -360,12 +361,19 @@ impl Inner {
         Ok(cmd)
     }
 
-    fn cmd_modify(&mut self, session: SessionId, msg: &RawMessage<'_>) -> Result<Command, &'static str> {
+    fn cmd_modify(
+        &mut self,
+        session: SessionId,
+        msg: &RawMessage<'_>,
+    ) -> Result<Command, &'static str> {
         let orig = msg
             .get_field_str(TAG_ORIG_CLORD)
             .or_else(|| msg.get_field_str(TAG_CLORD))
             .ok_or("fields")?;
-        let user_ref = *self.ids.get(&(session, orig.to_string())).ok_or("clordid")?;
+        let user_ref = *self
+            .ids
+            .get(&(session, orig.to_string()))
+            .ok_or("clordid")?;
         if let Some(cl) = msg.get_field_str(TAG_CLORD) {
             if cl != orig {
                 self.ids.insert((session, cl.to_string()), user_ref);
@@ -388,39 +396,39 @@ impl Inner {
         Ok(cmd)
     }
 
-fn pad_clord(s: &str) -> [u8; 14] {
-    let mut id = [b' '; 14];
-    let b = s.as_bytes();
-    let n = b.len().min(14);
-    id[..n].copy_from_slice(&b[..n]);
-    id
-}
-
-fn side_fix(side: Side) -> &'static str {
-    match side {
-        Side::Bid => "1",
-        Side::Ask => "2",
+    fn pad_clord(s: &str) -> [u8; 14] {
+        let mut id = [b' '; 14];
+        let b = s.as_bytes();
+        let n = b.len().min(14);
+        id[..n].copy_from_slice(&b[..n]);
+        id
     }
-}
 
-fn parse_side(s: &str) -> Option<Side> {
-    match s {
-        "1" => Some(Side::Bid),
-        "2" => Some(Side::Ask),
-        _ => None,
+    fn side_fix(side: Side) -> &'static str {
+        match side {
+            Side::Bid => "1",
+            Side::Ask => "2",
+        }
     }
-}
 
-fn parse_qty(s: &str) -> Option<u64> {
-    s.parse().ok()
-}
-
-fn parse_price(s: &str) -> Option<u64> {
-    if let Ok(v) = s.parse::<u64>() {
-        return Some(v);
+    fn parse_side(s: &str) -> Option<Side> {
+        match s {
+            "1" => Some(Side::Bid),
+            "2" => Some(Side::Ask),
+            _ => None,
+        }
     }
-    s.parse::<f64>().ok().map(|v| v as u64)
-}
+
+    fn parse_qty(s: &str) -> Option<u64> {
+        s.parse().ok()
+    }
+
+    fn parse_price(s: &str) -> Option<u64> {
+        if let Ok(v) = s.parse::<u64>() {
+            return Some(v);
+        }
+        s.parse::<f64>().ok().map(|v| v as u64)
+    }
 
     fn handle(
         &mut self,
@@ -431,35 +439,22 @@ fn parse_price(s: &str) -> Option<u64> {
     ) -> ParseOutcome {
         let begin = msg.begin_string().unwrap_or("");
         if begin != BEGIN {
-            return ParseOutcome::Disconnect {
-                bytes: 0,
-                consumed,
-            };
+            return ParseOutcome::Disconnect { bytes: 0, consumed };
         }
 
         let inbound_seq = match msg.get_field_as::<u64>(TAG_SEQ) {
             Ok(n) => n,
             Err(_) => {
-                return ParseOutcome::Disconnect {
-                    bytes: 0,
-                    consumed,
-                };
+                return ParseOutcome::Disconnect { bytes: 0, consumed };
             }
         };
 
         let sender = msg.get_field_str(TAG_SENDER).unwrap_or("");
         let target = msg.get_field_str(TAG_TARGET).unwrap_or("");
         if sender != self.them || target != self.us {
-            let seq_out = self
-                .sessions
-                .get(&session)
-                .map(|s| s.next_out)
-                .unwrap_or(1);
+            let seq_out = self.sessions.get(&session).map(|s| s.next_out).unwrap_or(1);
             let n = self.reject(seq_out, inbound_seq, "compid", reply);
-            return ParseOutcome::Disconnect {
-                bytes: n,
-                consumed,
-            };
+            return ParseOutcome::Disconnect { bytes: n, consumed };
         }
 
         let ty = msg.msg_type();
@@ -468,10 +463,7 @@ fn parse_price(s: &str) -> Option<u64> {
         if *ty == MsgType::Logon {
             if inbound_seq != 1 {
                 let n = self.reject(1, inbound_seq, "seq", reply);
-                return ParseOutcome::Disconnect {
-                    bytes: n,
-                    consumed,
-                };
+                return ParseOutcome::Disconnect { bytes: n, consumed };
             }
             let hb_secs = msg.get_field_as::<u64>(TAG_HB).unwrap_or(30);
             let n = self.frame(
@@ -494,37 +486,25 @@ fn parse_price(s: &str) -> Option<u64> {
                     hb: Duration::from_secs(hb_secs),
                 },
             );
-            return ParseOutcome::Reply {
-                bytes: n,
-                consumed,
-            };
+            return ParseOutcome::Reply { bytes: n, consumed };
         }
 
         let (next_in, next_out, logged_on) = match self.sessions.get(&session) {
             Some(s) => (s.next_in, s.next_out, s.logged_on),
             None => {
-                return ParseOutcome::Disconnect {
-                    bytes: 0,
-                    consumed,
-                };
+                return ParseOutcome::Disconnect { bytes: 0, consumed };
             }
         };
 
         if inbound_seq != next_in {
             let n = self.reject(next_out, inbound_seq, "seq", reply);
             self.sessions.remove(&session);
-            return ParseOutcome::Disconnect {
-                bytes: n,
-                consumed,
-            };
+            return ParseOutcome::Disconnect { bytes: n, consumed };
         }
 
         if !logged_on {
             self.sessions.remove(&session);
-            return ParseOutcome::Disconnect {
-                bytes: 0,
-                consumed,
-            };
+            return ParseOutcome::Disconnect { bytes: 0, consumed };
         }
 
         if let Some(sess) = self.sessions.get_mut(&session) {
@@ -532,10 +512,7 @@ fn parse_price(s: &str) -> Option<u64> {
         }
 
         match *ty {
-            MsgType::Heartbeat => ParseOutcome::Reply {
-                bytes: 0,
-                consumed,
-            },
+            MsgType::Heartbeat => ParseOutcome::Reply { bytes: 0, consumed },
             MsgType::TestRequest => {
                 let req = msg.get_field_str(TAG_TEST_REQ).unwrap_or("").to_owned();
                 let n = self.frame(
@@ -552,10 +529,7 @@ fn parse_price(s: &str) -> Option<u64> {
                     sess.next_out = next_out + 1;
                     sess.last_out = now;
                 }
-                ParseOutcome::Reply {
-                    bytes: n,
-                    consumed,
-                }
+                ParseOutcome::Reply { bytes: n, consumed }
             }
             MsgType::Logout => {
                 let n = self.frame(next_out, "5", |_| {}, reply);
@@ -564,20 +538,14 @@ fn parse_price(s: &str) -> Option<u64> {
                     sess.logged_on = false;
                     sess.last_out = now;
                 }
-                ParseOutcome::Reply {
-                    bytes: n,
-                    consumed,
-                }
+                ParseOutcome::Reply { bytes: n, consumed }
             }
             MsgType::NewOrderSingle
             | MsgType::OrderCancelRequest
             | MsgType::OrderCancelReplaceRequest => {
                 self.map_app(ty.clone(), session, msg, consumed, next_out, reply)
             }
-            _ => ParseOutcome::Reply {
-                bytes: 0,
-                consumed,
-            },
+            _ => ParseOutcome::Reply { bytes: 0, consumed },
         }
     }
 

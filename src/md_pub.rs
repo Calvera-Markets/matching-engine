@@ -1,8 +1,8 @@
 //! Public market-data multicast. Sole consumer of the public event ring.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::codec::MarketData;
 use crate::spsc::Spsc;

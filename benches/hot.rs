@@ -30,8 +30,8 @@ fn make_engine(slab: usize) -> MatchingEngine {
     let cmds = Arc::new(Spsc::<Command>::new(8));
     let ouch = Arc::new(Spsc::<Event>::new(1 << 14));
     let itch = Arc::new(Spsc::<Event>::new(1 << 14));
-    let mut eng = MatchingEngine::with_wal_size(cmds, ouch, itch, &wal, slab, 64 * 1024)
-        .expect("engine");
+    let mut eng =
+        MatchingEngine::with_wal_size(cmds, ouch, itch, &wal, slab, 64 * 1024).expect("engine");
     eng.set_wal(false);
     let _ = std::fs::remove_file(wal);
     eng

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, IntoRawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::codec::OrderEntry;
 use crate::spsc::Spsc;

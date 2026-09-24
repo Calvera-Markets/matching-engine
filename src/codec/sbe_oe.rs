@@ -4,11 +4,11 @@ use ironsbe_core::header::MessageHeader;
 
 use calvera_books::{Price, Side};
 
+use crate::codec::sbe::order_entry::Side as SbeSide;
 use crate::codec::sbe::order_entry::{
     ExecType, ExecutionReportEncoder, NewOrderSingleDecoder, OrdStatus,
     OrderCancelReplaceRequestDecoder, OrderCancelRequestDecoder, RejectEncoder, SCHEMA_ID,
 };
-use crate::codec::sbe::order_entry::Side as SbeSide;
 use crate::codec::{OrderEntry, ParseOutcome, SessionId};
 use crate::types::{Command, CommandType, Event, EventType};
 
@@ -62,8 +62,7 @@ impl SbeOe {
     }
 
     fn map_replace(session: SessionId, buf: &[u8], version: u16) -> Command {
-        let d =
-            OrderCancelReplaceRequestDecoder::wrap(buf, MessageHeader::ENCODED_LENGTH, version);
+        let d = OrderCancelReplaceRequestDecoder::wrap(buf, MessageHeader::ENCODED_LENGTH, version);
         let mut cmd = Command::blank(CommandType::Modify);
         cmd.client_fd = session.0;
         cmd.user_ref = d.user_ref();
@@ -96,7 +95,10 @@ impl OrderEntry for SbeOe {
         }
         match template_id {
             NewOrderSingleDecoder::TEMPLATE_ID => match self.map_add(session, buf, version) {
-                Ok(cmd) => ParseOutcome::Command { cmd, consumed: need },
+                Ok(cmd) => ParseOutcome::Command {
+                    cmd,
+                    consumed: need,
+                },
                 Err(user_ref) => ParseOutcome::Reply {
                     bytes: Self::reject(user_ref, 1, reply),
                     consumed: need,

@@ -151,7 +151,11 @@ fn unpack(frame: &WalFrame) -> Command {
             3 => CommandType::Reset,
             _ => CommandType::Poison,
         },
-        side: if frame.side == 0 { Side::Bid } else { Side::Ask },
+        side: if frame.side == 0 {
+            Side::Bid
+        } else {
+            Side::Ask
+        },
         price: Price(frame.price),
         quantity: frame.quantity,
         client_fd: frame.client_fd,
@@ -167,10 +171,7 @@ fn checksum(frame: &WalFrame) -> u32 {
     // Portable stand-in for `_mm_crc32_u64`. Good enough to detect torn writes.
     let mut h = 0x811c_9dc5_u32;
     let bytes = unsafe {
-        std::slice::from_raw_parts(
-            (frame as *const WalFrame as *const u8).add(8),
-            FRAME - 8,
-        )
+        std::slice::from_raw_parts((frame as *const WalFrame as *const u8).add(8), FRAME - 8)
     };
     for &b in bytes {
         h ^= b as u32;
