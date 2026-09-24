@@ -70,6 +70,12 @@ impl Packet {
     }
 }
 
+impl Default for Packet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MarketData for Packet {
     fn push(&mut self, evt: &Event) -> bool {
         Packet::push(self, evt)

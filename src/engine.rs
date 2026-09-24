@@ -187,34 +187,34 @@ impl MatchingEngine {
         let mut filled = 0u64;
         for fill in &fills {
             filled += fill.quantity;
-            if let Some(&key) = self.by_handle.get(&fill.resting_id) {
-                if let Some(maker) = self.by_client.get_mut(&key) {
-                    let px = maker.price;
-                    let uref = maker.user_ref;
-                    let hid = maker.handle.as_u64();
-                    let maker_fd = maker.client_fd;
-                    maker.qty = maker.qty.saturating_sub(fill.quantity);
-                    let dead = maker.qty == 0;
-                    if dead {
-                        self.by_client.remove(&key);
-                        self.by_handle.remove(&fill.resting_id);
-                    }
-                    let match_no = self.next_match;
-                    self.next_match += 1;
-                    self.emit_fill(
-                        taker.client_fd,
-                        maker_fd,
-                        EventTrade {
-                            match_number: match_no,
-                            maker_exchange_id: hid,
-                            maker_user_ref: uref,
-                            price: px,
-                            quantity: fill.quantity,
-                            taker_side: taker.side,
-                        },
-                    );
-                    continue;
+            if let Some(&key) = self.by_handle.get(&fill.resting_id)
+                && let Some(maker) = self.by_client.get_mut(&key)
+            {
+                let px = maker.price;
+                let uref = maker.user_ref;
+                let hid = maker.handle.as_u64();
+                let maker_fd = maker.client_fd;
+                maker.qty = maker.qty.saturating_sub(fill.quantity);
+                let dead = maker.qty == 0;
+                if dead {
+                    self.by_client.remove(&key);
+                    self.by_handle.remove(&fill.resting_id);
                 }
+                let match_no = self.next_match;
+                self.next_match += 1;
+                self.emit_fill(
+                    taker.client_fd,
+                    maker_fd,
+                    EventTrade {
+                        match_number: match_no,
+                        maker_exchange_id: hid,
+                        maker_user_ref: uref,
+                        price: px,
+                        quantity: fill.quantity,
+                        taker_side: taker.side,
+                    },
+                );
+                continue;
             }
             let match_no = self.next_match;
             self.next_match += 1;
