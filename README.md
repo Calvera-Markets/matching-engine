@@ -1,5 +1,8 @@
 # Matching Engine
 
+[![CI](https://github.com/Calvera-Markets/matching-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Calvera-Markets/matching-engine/actions/workflows/ci.yml)
+![coverage](badges/coverage.svg)
+
 Exchange matching engine with a compile-time swappable wire protocol (OUCH, ITCH, FIX, and SBE). It runs on 4 threads and 3 SPSC rings, and writes the WAL before it applies the order.
 
 The flow is the following:
