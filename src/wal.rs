@@ -184,3 +184,105 @@ fn use_raw_fd(file: &std::fs::File) -> libc::c_int {
     use std::os::fd::AsRawFd;
     file.as_raw_fd()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TempWal;
+    use crate::types::{Command, CommandType};
+    use calvera_books::{Price, Side};
+    use std::path::Path;
+
+    fn sample(ty: CommandType, side: Side, user: u32) -> Command {
+        let mut cmd = Command::blank(ty);
+        cmd.side = side;
+        cmd.user_ref = user;
+        cmd.price = Price(10 + user as u64);
+        cmd.quantity = 5 + user as u64;
+        cmd.client_fd = 3;
+        cmd.time_in_force = 7;
+        cmd.display = 8;
+        cmd.cl_ord_id = [b'Q'; 14];
+        cmd.capacity = 9;
+        cmd
+    }
+
+    #[test]
+    fn round_trips_every_command_and_stops_on_a_bad_checksum() {
+        let wal = TempWal::new("roundtrip");
+        let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
+        let mut none = 0;
+        w.recover(|_| none += 1);
+        assert_eq!(none, 0);
+
+        let written = [
+            sample(CommandType::Add, Side::Bid, 0),
+            sample(CommandType::Modify, Side::Ask, 1),
+            sample(CommandType::Cancel, Side::Bid, 2),
+            sample(CommandType::Reset, Side::Ask, 3),
+            sample(CommandType::Poison, Side::Bid, 4),
+        ];
+        for cmd in &written {
+            w.write(cmd);
+        }
+        assert_eq!(w.bytes_written(), written.len() * FRAME);
+
+        let mut got = Vec::new();
+        w.recover(|cmd| got.push(cmd));
+        assert_eq!(got.len(), written.len());
+        assert_eq!(got[4].ty, CommandType::Poison);
+        assert_eq!(got[1].side, Side::Ask);
+        unsafe {
+            *w.ptr.add(4 * FRAME + 16) = 0xAB;
+        }
+        got.clear();
+        w.recover(|cmd| got.push(cmd));
+        assert_eq!(got.len(), 4);
+        assert_eq!(w.bytes_written(), 4 * FRAME);
+        for (got, want) in got.iter().zip(written.iter()) {
+            assert_eq!(got.ty, want.ty);
+            assert_eq!(got.side, want.side);
+            assert_eq!(got.user_ref, want.user_ref);
+            assert_eq!(got.price, want.price);
+            assert_eq!(got.quantity, want.quantity);
+            assert_eq!(got.client_fd, want.client_fd);
+            assert_eq!(got.time_in_force, want.time_in_force);
+            assert_eq!(got.display, want.display);
+            assert_eq!(got.cl_ord_id, want.cl_ord_id);
+            assert_eq!(got.capacity, 0);
+        }
+    }
+
+    #[test]
+    fn write_stops_when_the_file_is_full() {
+        let wal = TempWal::new("full");
+        let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
+        let cmd = sample(CommandType::Add, Side::Bid, 1);
+        for _ in 0..(4096 / FRAME) {
+            w.write(&cmd);
+        }
+        assert_eq!(w.bytes_written(), 4096);
+        w.write(&cmd);
+        assert_eq!(w.bytes_written(), 4096);
+    }
+
+    #[test]
+    fn a_zero_length_map_fails() {
+        let wal = TempWal::new("zero");
+        assert!(Wal::open_sized(&wal.0, 0).is_err());
+    }
+
+    #[test]
+    fn missing_directory_fails() {
+        let err = Wal::open_sized(Path::new("/no/such/me-wal-dir/book.wal"), 4096);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn open_uses_the_default_size() {
+        let wal = TempWal::new("default");
+        let w = Wal::open(&wal.0).unwrap();
+        assert_eq!(w.len, WAL_SIZE);
+        assert_eq!(w.bytes_written(), 0);
+    }
+}

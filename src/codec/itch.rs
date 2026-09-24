@@ -133,3 +133,108 @@ fn delete(evt: &Event, out: &mut [u8]) -> usize {
     out[7..15].copy_from_slice(&evt.order.order_id.to_be_bytes());
     N
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::MarketData;
+    use crate::types::{Event, EventOrder, EventReject, EventTrade, EventType};
+    use calvera_books::{Price, Side};
+
+    fn order(side: Side) -> EventOrder {
+        EventOrder {
+            order_id: 0x11,
+            user_ref: 1,
+            price: Price(50),
+            quantity: 8,
+            side,
+            order_state: b'L',
+            cl_ord_id: [b'I'; 14],
+        }
+    }
+
+    fn trade() -> Event {
+        Event::trade(
+            1,
+            EventTrade {
+                match_number: 4,
+                maker_exchange_id: 0x22,
+                maker_user_ref: 2,
+                price: Price(50),
+                quantity: 3,
+                taker_side: Side::Ask,
+            },
+        )
+    }
+
+    #[test]
+    fn packs_add_execute_and_delete_and_skips_the_rest() {
+        let mut pkt = Packet::new();
+        assert!(pkt.empty());
+        assert!(pkt.take().is_none());
+
+        let bid = Event::accepted(1, order(Side::Bid));
+        let ask = Event::accepted(1, order(Side::Ask));
+        assert!(pkt.push(&bid));
+        assert!(pkt.push(&ask));
+        assert!(!pkt.empty());
+        let bytes = pkt.take().unwrap().to_vec();
+        assert_eq!(&bytes[..10], b"OB_SESSION");
+        assert_eq!(u64::from_be_bytes(bytes[10..18].try_into().unwrap()), 1);
+        assert_eq!(u16::from_be_bytes(bytes[18..20].try_into().unwrap()), 2);
+        assert_eq!(bytes[22], b'A');
+        assert_eq!(bytes[22 + 15], b'B');
+        assert!(pkt.empty());
+
+        assert!(pkt.push(&trade()));
+        assert!(pkt.push(&Event::cancelled(1, order(Side::Bid))));
+        let bytes = pkt.take().unwrap().to_vec();
+        assert_eq!(u64::from_be_bytes(bytes[10..18].try_into().unwrap()), 3);
+        assert_eq!(bytes[22], b'E');
+
+        assert!(pkt.push(&Event::rejected(
+            1,
+            EventReject {
+                user_ref: 1,
+                reason: 0,
+                cl_ord_id: [b' '; 14],
+            },
+        )));
+        assert!(pkt.push(&Event::modified(1, order(Side::Bid))));
+        assert!(pkt.push(&Event::reset()));
+        assert!(pkt.empty());
+        assert_eq!(Event::reset().ty, EventType::BookReset);
+
+        assert!(MarketData::push(&mut pkt, &bid));
+        assert!(MarketData::take(&mut pkt).is_some());
+    }
+
+    #[test]
+    fn returns_false_when_the_packet_is_full() {
+        let mut pkt = Packet::new();
+        let ev = Event::accepted(1, order(Side::Bid));
+        let mut n = 0;
+        while pkt.push(&ev) {
+            n += 1;
+            assert!(n < 100, "packet never filled");
+        }
+        assert!(n > 1);
+        assert!(pkt.take().is_some());
+    }
+
+    #[test]
+    fn short_buffers_encode_nothing() {
+        let ev = Event::accepted(1, order(Side::Bid));
+        assert_eq!(add(&ev, &mut [0u8; 8]), 0);
+        assert_eq!(executed(&trade(), &mut [0u8; 8]), 0);
+        assert_eq!(delete(&ev, &mut [0u8; 8]), 0);
+
+        let mut wide = [0u8; 64];
+        assert_eq!(add(&Event::accepted(1, order(Side::Ask)), &mut wide), 36);
+        assert_eq!(wide[15], b'S');
+        assert_eq!(executed(&trade(), &mut wide), 31);
+        assert_eq!(wide[0], b'E');
+        assert_eq!(delete(&ev, &mut wide), 19);
+        assert_eq!(wide[0], b'D');
+    }
+}

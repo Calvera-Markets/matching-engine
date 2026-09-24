@@ -81,3 +81,47 @@ impl<T> Drop for Spsc<T> {
         while self.pop().is_some() {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn reports_capacity_and_rejects_a_full_ring() {
+        let q = Spsc::new(2);
+        assert_eq!(q.cap(), 2);
+        assert!(q.try_push(1).is_ok());
+        assert!(q.try_push(2).is_ok());
+        assert_eq!(q.try_push(3).err(), Some(3));
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(2));
+        assert_eq!(q.pop(), None);
+    }
+
+    #[test]
+    fn push_waits_until_a_slot_frees() {
+        let q = Arc::new(Spsc::new(1));
+        q.push(1);
+        let writer = Arc::clone(&q);
+        let handle = thread::spawn(move || writer.push(2));
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(q.pop(), Some(1));
+        handle.join().unwrap();
+        assert_eq!(q.pop(), Some(2));
+    }
+
+    #[test]
+    fn drop_drains_what_is_left() {
+        let q = Spsc::new(2);
+        q.push(1);
+        drop(q);
+    }
+
+    #[test]
+    fn capacity_must_be_a_power_of_two() {
+        assert!(std::panic::catch_unwind(|| Spsc::<u8>::new(3)).is_err());
+    }
+}

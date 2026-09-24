@@ -75,3 +75,75 @@ impl<Oe> Drop for Egress<Oe> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::ouch::Ouch;
+    use crate::spsc::Spsc;
+    use crate::types::{Event, EventOrder, EventType};
+    use calvera_books::{Price, Side};
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+    use std::time::Duration;
+
+    fn accepted(fd: i32, side: Side) -> Event {
+        Event::accepted(
+            fd,
+            EventOrder {
+                order_id: 5,
+                user_ref: 7,
+                price: Price(10),
+                quantity: 3,
+                side,
+                order_state: b'L',
+                cl_ord_id: [b'E'; 14],
+            },
+        )
+    }
+
+    #[test]
+    fn writes_acks_and_skips_silent_events() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_nodelay(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_nodelay(true).unwrap();
+        let fd = server.as_raw_fd();
+
+        let events = Arc::new(Spsc::new(128));
+        events.push(Event::reset());
+        let mut quiet = Event::reset();
+        quiet.client_fd = fd;
+        quiet.ty = EventType::BookReset;
+        events.push(quiet);
+        events.push(accepted(fd, Side::Bid));
+        events.push(accepted(fd, Side::Ask));
+        for _ in 0..64 {
+            events.push(accepted(fd, Side::Bid));
+        }
+
+        let running = AtomicBool::new(true);
+        let mut eg = Egress::new(events.clone(), Ouch);
+        thread::scope(|s| {
+            s.spawn(|| eg.run(&running));
+            let mut buf = [0u8; 64];
+            let n = client.read(&mut buf).unwrap();
+            assert_eq!(n, 64);
+            assert_eq!(buf[0], b'A');
+            assert_eq!(buf[13], b'B');
+            thread::sleep(Duration::from_millis(20));
+            running.store(false, Ordering::Relaxed);
+        });
+        drop(server);
+    }
+}

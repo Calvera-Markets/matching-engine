@@ -150,8 +150,7 @@ impl MatchingEngine {
                     self.accept(cmd, handle, remaining, b'L');
                 }
             }
-            Err(BookError::SlabFull) => self.reject(cmd, 1),
-            Err(_) => self.reject(cmd, 0),
+            Err(err) => self.reject(cmd, u16::from(err == BookError::SlabFull)),
         }
     }
 
@@ -304,5 +303,301 @@ impl MatchingEngine {
         if maker_fd != taker_fd {
             self.ouch.push(Event::trade(maker_fd, trade));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TempWal;
+    use crate::spsc::Spsc;
+    use crate::types::{Command, CommandType, Event, EventReject, EventType};
+    use calvera_books::{Fill, OrderHandle, Price, Side, SlabIndex};
+    use std::num::NonZeroU32;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+    use std::thread;
+    use std::time::Duration;
+
+    fn order(ty: CommandType, fd: i32, user: u32, side: Side, px: u64, qty: u64) -> Command {
+        let mut cmd = Command::blank(ty);
+        cmd.client_fd = fd;
+        cmd.user_ref = user;
+        cmd.side = side;
+        cmd.price = Price(px);
+        cmd.quantity = qty;
+        cmd
+    }
+
+    fn pop_all(q: &Spsc<Event>) -> Vec<Event> {
+        let mut out = Vec::new();
+        while let Some(ev) = q.pop() {
+            out.push(ev);
+        }
+        out
+    }
+
+    type Rig = (
+        MatchingEngine,
+        Arc<Spsc<Command>>,
+        Arc<Spsc<Event>>,
+        Arc<Spsc<Event>>,
+    );
+
+    fn open(wal: &TempWal, slab: usize) -> Rig {
+        let cmds = Arc::new(Spsc::new(64));
+        let ouch = Arc::new(Spsc::new(64));
+        let itch = Arc::new(Spsc::new(64));
+        let eng = MatchingEngine::with_wal_size(
+            cmds.clone(),
+            ouch.clone(),
+            itch.clone(),
+            &wal.0,
+            slab,
+            64 * 1024,
+        )
+        .unwrap();
+        (eng, cmds, ouch, itch)
+    }
+
+    #[test]
+    fn rejects_a_duplicate_client_key() {
+        let wal = TempWal::new("dup");
+        let (mut eng, _, ouch, itch) = open(&wal, 64);
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 101, 3));
+        let private = pop_all(&ouch);
+        assert_eq!(private[0].ty, EventType::OrderAccepted);
+        assert_eq!(private[1].ty, EventType::OrderRejected);
+        assert_eq!(private[1].reject.reason, 0);
+        assert!(
+            pop_all(&itch)
+                .iter()
+                .all(|e| e.ty != EventType::OrderRejected)
+        );
+    }
+
+    #[test]
+    fn partial_fill_leaves_the_maker_and_a_crossing_bid_rests() {
+        let wal = TempWal::new("partial");
+        let (mut eng, _, ouch, itch) = open(&wal, 64);
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+        eng.step(&order(CommandType::Add, 2, 2, Side::Ask, 100, 4));
+        eng.step(&order(CommandType::Cancel, 1, 1, Side::Bid, 0, 0));
+        let private = pop_all(&ouch);
+        let cancel = private
+            .iter()
+            .find(|e| e.ty == EventType::OrderCancelled)
+            .unwrap();
+        assert_eq!(cancel.order.quantity, 6);
+        assert!(
+            private
+                .iter()
+                .filter(|e| e.ty == EventType::OrderAccepted)
+                .all(|e| e.order.user_ref == 1)
+        );
+        assert_eq!(
+            pop_all(&itch)
+                .iter()
+                .filter(|e| e.ty == EventType::TradeExecuted)
+                .count(),
+            1
+        );
+
+        eng.step(&order(CommandType::Add, 3, 3, Side::Ask, 100, 5));
+        eng.step(&order(CommandType::Add, 4, 4, Side::Bid, 100, 12));
+        let private = pop_all(&ouch);
+        let rest = private
+            .iter()
+            .find(|e| e.ty == EventType::OrderAccepted && e.order.user_ref == 4)
+            .unwrap();
+        assert_eq!(rest.order.quantity, 7);
+        assert_eq!(rest.order.order_state, b'L');
+    }
+
+    #[test]
+    fn cancel_modify_and_reset() {
+        let wal = TempWal::new("lifecycle");
+        let (mut eng, _, ouch, itch) = open(&wal, 64);
+        eng.step(&order(CommandType::Cancel, 9, 9, Side::Bid, 0, 0));
+        assert!(ouch.pop().is_none());
+
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+        eng.step(&order(CommandType::Modify, 1, 1, Side::Ask, 110, 4));
+        let private = pop_all(&ouch);
+        assert_eq!(private[1].ty, EventType::OrderCancelled);
+        assert_eq!(private[2].ty, EventType::OrderAccepted);
+        assert_eq!(private[2].order.quantity, 4);
+        assert_eq!(private[2].order.side, Side::Ask);
+
+        eng.step(&Command::reset());
+        let private = pop_all(&ouch);
+        assert_eq!(private.last().unwrap().ty, EventType::BookReset);
+        assert!(pop_all(&itch).iter().all(|e| e.ty != EventType::BookReset));
+
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 80, 1));
+        assert_eq!(ouch.pop().unwrap().ty, EventType::OrderAccepted);
+    }
+
+    #[test]
+    fn slab_full_rejects_with_reason_one() {
+        let wal = TempWal::new("slab");
+        let (mut eng, _, ouch, _) = open(&wal, 2);
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 1));
+        eng.step(&order(CommandType::Add, 1, 2, Side::Bid, 101, 1));
+        let private = pop_all(&ouch);
+        assert_eq!(private[1].ty, EventType::OrderRejected);
+        assert_eq!(private[1].reject.reason, 1);
+        eng.step(&order(CommandType::Add, 1, 3, Side::Ask, 200, 1));
+        assert_eq!(ouch.pop().unwrap().ty, EventType::OrderAccepted);
+    }
+
+    #[test]
+    fn wal_can_be_disabled_and_poison_is_not_applied() {
+        let wal = TempWal::new("wal-off");
+        let (mut eng, _, ouch, _) = open(&wal, 64);
+        eng.set_wal(false);
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 1));
+        assert_eq!(eng.wal.bytes_written(), 0);
+        assert_eq!(ouch.pop().unwrap().ty, EventType::OrderAccepted);
+
+        eng.set_wal(true);
+        eng.step(&order(CommandType::Add, 1, 2, Side::Ask, 101, 1));
+        assert_eq!(eng.wal.bytes_written(), 64);
+        let _ = pop_all(&ouch);
+
+        let before = eng.wal.bytes_written();
+        eng.step(&Command::poison());
+        assert_eq!(eng.wal.bytes_written(), before);
+        assert!(ouch.pop().is_none());
+    }
+
+    #[test]
+    fn drain_empties_both_rings() {
+        let wal = TempWal::new("drain");
+        let (mut eng, _, ouch, itch) = open(&wal, 64);
+        eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+        eng.step(&order(CommandType::Add, 2, 2, Side::Ask, 100, 10));
+        assert!(eng.drain_events() > 0);
+        assert!(ouch.pop().is_none());
+        assert!(itch.pop().is_none());
+        assert_eq!(eng.drain_events(), 0);
+    }
+
+    #[test]
+    fn run_spins_until_poison() {
+        let wal = TempWal::new("spin");
+        let (mut eng, cmds, _, _) = open(&wal, 64);
+        let running = AtomicBool::new(true);
+        thread::scope(|s| {
+            s.spawn(|| eng.run(&running));
+            thread::sleep(Duration::from_millis(20));
+            cmds.push(Command::poison());
+        });
+    }
+
+    #[test]
+    fn recovery_replays_without_publishing() {
+        let wal = TempWal::new("recover");
+        {
+            let (mut eng, _, ouch, _) = open(&wal, 64);
+            eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+            eng.step(&order(CommandType::Add, 2, 2, Side::Ask, 100, 4));
+            eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 1));
+            eng.step(&Command::reset());
+            eng.step(&order(CommandType::Add, 3, 3, Side::Ask, 50, 2));
+            assert!(ouch.pop().is_some());
+        }
+        let (mut eng, _, ouch, itch) = open(&wal, 64);
+        assert!(ouch.pop().is_none());
+        assert!(itch.pop().is_none());
+        eng.step(&order(CommandType::Cancel, 3, 3, Side::Ask, 0, 0));
+        let ev = ouch.pop().unwrap();
+        assert_eq!(ev.ty, EventType::OrderCancelled);
+        assert_eq!(ev.order.user_ref, 3);
+        assert_eq!(ev.order.quantity, 2);
+    }
+
+    #[test]
+    fn an_untracked_fill_prints_once_and_a_quiet_engine_prints_nothing() {
+        let wal = TempWal::new("orphan");
+        let (mut eng, _, ouch, itch) = open(&wal, 64);
+        let handle = OrderHandle::new(Side::Bid, SlabIndex::new(1), NonZeroU32::new(1).unwrap());
+        let taker = order(CommandType::Add, 9, 9, Side::Ask, 100, 4);
+
+        eng.publish = false;
+        eng.book.consumer.fills.push(Fill {
+            resting_id: handle,
+            quantity: 4,
+        });
+        assert_eq!(eng.publish_fills(&taker), 4);
+        assert!(ouch.pop().is_none());
+        eng.emit(Event::rejected(
+            1,
+            EventReject {
+                user_ref: 1,
+                reason: 3,
+                cl_ord_id: [b' '; 14],
+            },
+        ));
+        assert!(ouch.pop().is_none());
+
+        eng.publish = true;
+        eng.by_handle.insert(handle, 99);
+        eng.book.consumer.fills.push(Fill {
+            resting_id: handle,
+            quantity: 4,
+        });
+        assert_eq!(eng.publish_fills(&taker), 4);
+        let ev = ouch.pop().unwrap();
+        assert_eq!(ev.ty, EventType::TradeExecuted);
+        assert_eq!(ev.client_fd, 9);
+        assert_eq!(ev.trade.maker_user_ref, 0);
+        assert_eq!(ev.trade.quantity, 4);
+        assert!(itch.pop().is_some());
+        assert!(ouch.pop().is_none());
+
+        eng.emit(Event::rejected(
+            4,
+            EventReject {
+                user_ref: 8,
+                reason: 3,
+                cl_ord_id: [b'R'; 14],
+            },
+        ));
+        let ev = ouch.pop().unwrap();
+        assert_eq!(ev.ty, EventType::OrderRejected);
+        assert_eq!(ev.reject.reason, 3);
+        assert!(itch.pop().is_none());
+        eng.emit(Event::reset());
+        assert_eq!(ouch.pop().unwrap().ty, EventType::BookReset);
+        assert!(itch.pop().is_none());
+    }
+
+    #[test]
+    fn missing_wal_directory_fails() {
+        let err = MatchingEngine::with_wal_size(
+            Arc::new(Spsc::new(2)),
+            Arc::new(Spsc::new(2)),
+            Arc::new(Spsc::new(2)),
+            Path::new("/no/such/me-engine-dir/book.wal"),
+            64,
+            4096,
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn new_opens_the_default_wal() {
+        let wal = TempWal::new("new");
+        let eng = MatchingEngine::new(
+            Arc::new(Spsc::new(2)),
+            Arc::new(Spsc::new(2)),
+            Arc::new(Spsc::new(2)),
+            &wal.0,
+            64,
+        )
+        .unwrap();
+        assert_eq!(eng.wal.bytes_written(), 0);
     }
 }

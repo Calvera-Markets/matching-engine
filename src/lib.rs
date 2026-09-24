@@ -38,6 +38,27 @@ pub fn lock_memory() {
 }
 
 #[cfg(test)]
+pub(crate) struct TempWal(pub std::path::PathBuf);
+
+#[cfg(test)]
+impl TempWal {
+    pub(crate) fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("me-{label}-{}-{n}.wal", std::process::id()));
+        Self(path)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempWal {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -153,5 +174,12 @@ mod tests {
         assert_eq!(public_trades[0].trade.quantity, 10);
 
         let _ = std::fs::remove_file(dir);
+    }
+
+    #[test]
+    fn pauses_pins_and_locks() {
+        pause();
+        pin_to_cpu(0);
+        lock_memory();
     }
 }

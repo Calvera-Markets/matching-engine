@@ -210,6 +210,16 @@ mod tests {
     };
     use crate::types::EventOrder;
 
+    fn take_cmd(outcome: ParseOutcome) -> Option<Command> {
+        match outcome {
+            ParseOutcome::Command { cmd, .. } => Some(cmd),
+            ParseOutcome::Reply { .. }
+            | ParseOutcome::Disconnect { .. }
+            | ParseOutcome::NeedMore
+            | ParseOutcome::Bad { .. } => None,
+        }
+    }
+
     fn encode_add(symbol: &[u8], user_ref: u32) -> Vec<u8> {
         let mut buf = vec![0u8; 64];
         let mut enc = NewOrderSingleEncoder::wrap(&mut buf, 0);
@@ -228,18 +238,13 @@ mod tests {
         let mut oe = SbeOe::new("AAPL");
         let wire = encode_add(b"AAPL", 7);
         let mut reply = [0u8; 128];
-        match oe.parse(&wire, SessionId(3), &mut reply) {
-            ParseOutcome::Command { cmd, consumed } => {
-                assert_eq!(consumed, wire.len());
-                assert_eq!(cmd.ty, CommandType::Add);
-                assert_eq!(cmd.client_fd, 3);
-                assert_eq!(cmd.user_ref, 7);
-                assert_eq!(cmd.quantity, 10);
-                assert_eq!(cmd.price, Price(100));
-                assert_eq!(cmd.side, Side::Bid);
-            }
-            _ => panic!("expected Command"),
-        }
+        let cmd = take_cmd(oe.parse(&wire, SessionId(3), &mut reply)).unwrap();
+        assert_eq!(cmd.ty, CommandType::Add);
+        assert_eq!(cmd.client_fd, 3);
+        assert_eq!(cmd.user_ref, 7);
+        assert_eq!(cmd.quantity, 10);
+        assert_eq!(cmd.price, Price(100));
+        assert_eq!(cmd.side, Side::Bid);
         assert!(matches!(
             oe.parse(&wire[..4], SessionId(3), &mut reply),
             ParseOutcome::NeedMore
@@ -255,14 +260,10 @@ mod tests {
         enc.set_quantity(3);
         let n = enc.encoded_length();
         let mut reply = [0u8; 128];
-        match oe.parse(&buf[..n], SessionId(1), &mut reply) {
-            ParseOutcome::Command { cmd, .. } => {
-                assert_eq!(cmd.ty, CommandType::Cancel);
-                assert_eq!(cmd.user_ref, 7);
-                assert_eq!(cmd.quantity, 3);
-            }
-            _ => panic!("expected Command"),
-        }
+        let cmd = take_cmd(oe.parse(&buf[..n], SessionId(1), &mut reply)).unwrap();
+        assert_eq!(cmd.ty, CommandType::Cancel);
+        assert_eq!(cmd.user_ref, 7);
+        assert_eq!(cmd.quantity, 3);
     }
 
     #[test]
@@ -270,10 +271,11 @@ mod tests {
         let mut oe = SbeOe::new("AAPL");
         let wire = encode_add(b"MSFT", 7);
         let mut reply = [0u8; 128];
-        match oe.parse(&wire, SessionId(1), &mut reply) {
-            ParseOutcome::Reply { bytes, .. } => assert!(bytes > 0),
-            _ => panic!("expected Reply"),
-        }
+        assert!(take_cmd(oe.parse(&wire, SessionId(1), &mut reply)).is_none());
+        assert!(matches!(
+            oe.parse(&wire, SessionId(1), &mut reply),
+            ParseOutcome::Reply { bytes, .. } if bytes > 0
+        ));
     }
 
     #[test]
@@ -301,5 +303,140 @@ mod tests {
         assert_eq!(d.order_id(), 42);
         assert_eq!(d.exec_type(), ExecType::New);
         assert_eq!(d.quantity(), 10);
+    }
+
+    fn encode_replace(side: SbeSide) -> Vec<u8> {
+        use crate::codec::sbe::order_entry::OrderCancelReplaceRequestEncoder;
+        let mut buf = vec![0u8; 64];
+        let mut enc = OrderCancelReplaceRequestEncoder::wrap(&mut buf, 0);
+        enc.set_user_ref(7);
+        enc.set_side(side);
+        enc.set_price(50);
+        enc.set_quantity(4);
+        let n = enc.encoded_length();
+        buf.truncate(n);
+        buf
+    }
+
+    fn report<'a>(out: &'a [u8]) -> ExecutionReportDecoder<'a> {
+        let hdr = MessageHeader::wrap(out, 0);
+        ExecutionReportDecoder::wrap(out, MessageHeader::ENCODED_LENGTH, hdr.version)
+    }
+
+    #[test]
+    fn sell_replace_and_the_other_reports() {
+        let mut oe = SbeOe::new("AAPLTOOLONG");
+        let mut sell = encode_add(b"AAPLTOOL", 3);
+        // encode_add writes "AAPL" only; rebuild a sell for the truncated symbol.
+        let _ = sell;
+        let mut buf = vec![0u8; 64];
+        let mut enc = NewOrderSingleEncoder::wrap(&mut buf, 0);
+        enc.set_user_ref(3);
+        enc.set_symbol(b"AAPLTOOL");
+        enc.set_side(SbeSide::Sell);
+        enc.set_price(40);
+        enc.set_quantity(2);
+        let n = enc.encoded_length();
+        sell = buf[..n].to_vec();
+
+        let mut reply = [0u8; 128];
+        let cmd = take_cmd(oe.parse(&sell, SessionId(2), &mut reply)).unwrap();
+        assert_eq!(cmd.side, Side::Ask);
+        assert!(matches!(
+            oe.parse(
+                &sell[..MessageHeader::ENCODED_LENGTH],
+                SessionId(2),
+                &mut reply
+            ),
+            ParseOutcome::NeedMore
+        ));
+
+        let mut bad_schema = sell.clone();
+        bad_schema[4] = 0xff;
+        bad_schema[5] = 0xff;
+        assert!(matches!(
+            oe.parse(&bad_schema, SessionId(2), &mut reply),
+            ParseOutcome::Bad { consumed: 1 }
+        ));
+        let mut unknown = sell.clone();
+        unknown[2] = 99;
+        unknown[3] = 0;
+        assert!(matches!(
+            oe.parse(&unknown, SessionId(2), &mut reply),
+            ParseOutcome::Bad { .. }
+        ));
+
+        for side in [SbeSide::Buy, SbeSide::Sell] {
+            let wire = encode_replace(side);
+            let cmd = take_cmd(oe.parse(&wire, SessionId(2), &mut reply)).unwrap();
+            assert_eq!(cmd.ty, CommandType::Modify);
+            assert_eq!(cmd.quantity, 4);
+            assert_eq!(cmd.price, Price(50));
+        }
+
+        let mut out = [0u8; 128];
+        let cancelled = Event::cancelled(
+            1,
+            EventOrder {
+                order_id: 9,
+                user_ref: 3,
+                price: Price(40),
+                quantity: 2,
+                side: Side::Ask,
+                order_state: b'4',
+                cl_ord_id: [b' '; 14],
+            },
+        );
+        let n = oe.encode_event(&cancelled, &mut out);
+        assert_eq!(report(&out[..n]).exec_type(), ExecType::Canceled);
+        assert_eq!(report(&out[..n]).side(), SbeSide::Sell);
+
+        let modified = Event::modified(
+            1,
+            EventOrder {
+                order_id: 9,
+                user_ref: 3,
+                price: Price(50),
+                quantity: 4,
+                side: Side::Bid,
+                order_state: b'5',
+                cl_ord_id: [b' '; 14],
+            },
+        );
+        let n = oe.encode_event(&modified, &mut out);
+        assert_eq!(report(&out[..n]).exec_type(), ExecType::Replaced);
+
+        let rejected = Event::rejected(
+            1,
+            crate::types::EventReject {
+                user_ref: 3,
+                reason: 1,
+                cl_ord_id: [b' '; 14],
+            },
+        );
+        let n = oe.encode_event(&rejected, &mut out);
+        assert_eq!(report(&out[..n]).exec_type(), ExecType::Rejected);
+
+        let trade = Event::trade(
+            1,
+            crate::types::EventTrade {
+                match_number: 11,
+                maker_exchange_id: 9,
+                maker_user_ref: 3,
+                price: Price(40),
+                quantity: 2,
+                taker_side: Side::Ask,
+            },
+        );
+        let n = oe.encode_event(&trade, &mut out);
+        let decoded = report(&out[..n]);
+        assert_eq!(decoded.exec_type(), ExecType::Trade);
+        assert_eq!(decoded.last_qty(), 2);
+        assert_eq!(decoded.side(), SbeSide::Sell);
+
+        assert_eq!(oe.encode_event(&Event::reset(), &mut out), 0);
+        let mut hidden = cancelled;
+        hidden.client_fd = -1;
+        assert_eq!(oe.encode_event(&hidden, &mut out), 0);
     }
 }

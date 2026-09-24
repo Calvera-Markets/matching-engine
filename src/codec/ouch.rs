@@ -181,3 +181,188 @@ impl OrderEntry for Ouch {
         serialize(evt, out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{OrderEntry, ParseOutcome, SessionId};
+    use crate::types::{CommandType, Event, EventOrder, EventReject, EventTrade, EventType};
+    use calvera_books::{Price, Side};
+
+    fn order(side: Side) -> EventOrder {
+        EventOrder {
+            order_id: 0xabc,
+            user_ref: 7,
+            price: Price(99),
+            quantity: 12,
+            side,
+            order_state: b'L',
+            cl_ord_id: [b'C'; 14],
+        }
+    }
+
+    fn enter(side: u8) -> [u8; ENTER_LEN] {
+        let mut buf = [0u8; ENTER_LEN];
+        buf[0] = ENTER;
+        buf[1..5].copy_from_slice(&7u32.to_be_bytes());
+        buf[5] = side;
+        buf[6..10].copy_from_slice(&12u32.to_be_bytes());
+        buf[18..26].copy_from_slice(&99u64.to_be_bytes());
+        buf[26] = b'I';
+        buf[27] = b'P';
+        buf[28] = b'A';
+        buf[31..45].copy_from_slice(&[b'C'; 14]);
+        buf
+    }
+
+    #[test]
+    fn parses_enter_cancel_and_modify() {
+        let (cmd, n) = parse(&enter(b'B'), 4).unwrap();
+        assert_eq!(n, ENTER_LEN);
+        assert_eq!(cmd.ty, CommandType::Add);
+        assert_eq!(cmd.client_fd, 4);
+        assert_eq!(cmd.user_ref, 7);
+        assert_eq!(cmd.side, Side::Bid);
+        assert_eq!(cmd.quantity, 12);
+        assert_eq!(cmd.price, Price(99));
+        assert_eq!(cmd.time_in_force, b'I');
+        assert_eq!(cmd.display, b'P');
+        assert_eq!(cmd.capacity, b'A');
+        assert_eq!(cmd.cl_ord_id, [b'C'; 14]);
+
+        let (cmd, _) = parse(&enter(b'S'), 4).unwrap();
+        assert_eq!(cmd.side, Side::Ask);
+
+        let mut cancel = [0u8; CANCEL_LEN];
+        cancel[0] = CANCEL;
+        cancel[1..5].copy_from_slice(&3u32.to_be_bytes());
+        cancel[5..9].copy_from_slice(&8u32.to_be_bytes());
+        let (cmd, n) = parse(&cancel, 2).unwrap();
+        assert_eq!(n, CANCEL_LEN);
+        assert_eq!(cmd.ty, CommandType::Cancel);
+        assert_eq!(cmd.user_ref, 3);
+        assert_eq!(cmd.quantity, 8);
+        assert_eq!(cmd.client_fd, 2);
+
+        let mut modify = [0u8; MODIFY_LEN];
+        modify[0] = MODIFY;
+        modify[1..5].copy_from_slice(&3u32.to_be_bytes());
+        modify[5] = b'S';
+        modify[6..10].copy_from_slice(&6u32.to_be_bytes());
+        let (cmd, n) = parse(&modify, 2).unwrap();
+        assert_eq!(n, MODIFY_LEN);
+        assert_eq!(cmd.ty, CommandType::Modify);
+        assert_eq!(cmd.side, Side::Ask);
+        assert_eq!(cmd.quantity, 6);
+
+        modify[5] = b'B';
+        let (cmd, _) = parse(&modify, 2).unwrap();
+        assert_eq!(cmd.side, Side::Bid);
+    }
+
+    #[test]
+    fn short_and_unknown_messages_do_not_parse() {
+        assert!(parse(&[], 1).is_none());
+        assert!(parse(&[ENTER], 1).is_none());
+        assert!(parse(&[CANCEL], 1).is_none());
+        assert!(parse(&[MODIFY], 1).is_none());
+        assert!(parse(&[b'Z'; ENTER_LEN], 1).is_none());
+
+        let mut ouch = Ouch;
+        let mut reply = [0u8; 8];
+        assert!(matches!(
+            OrderEntry::parse(&mut ouch, &[], SessionId(1), &mut reply),
+            ParseOutcome::NeedMore
+        ));
+        assert!(matches!(
+            OrderEntry::parse(&mut ouch, &[ENTER], SessionId(1), &mut reply),
+            ParseOutcome::NeedMore
+        ));
+        assert!(matches!(
+            OrderEntry::parse(&mut ouch, &[b'Z'; ENTER_LEN], SessionId(1), &mut reply),
+            ParseOutcome::Bad { consumed: 1 }
+        ));
+        let buf = enter(b'B');
+        let outcome = OrderEntry::parse(&mut ouch, &buf, SessionId(5), &mut reply);
+        assert!(matches!(
+            outcome,
+            ParseOutcome::Command {
+                consumed: ENTER_LEN,
+                ..
+            }
+        ));
+        if let ParseOutcome::Command { cmd, consumed } = outcome {
+            assert_eq!(consumed, ENTER_LEN);
+            assert_eq!(cmd.client_fd, 5);
+            assert_eq!(cmd.ty, CommandType::Add);
+        }
+    }
+
+    #[test]
+    fn serializes_each_event_and_rejects_a_short_buffer() {
+        let mut out = [0u8; 64];
+        let accepted = Event::accepted(1, order(Side::Bid));
+        assert_eq!(serialize(&accepted, &mut out), 64);
+        assert_eq!(out[0], b'A');
+        assert_eq!(out[13], b'B');
+        assert_eq!(out[48], b'L');
+        assert_eq!(&out[49..63], &[b'C'; 14]);
+        assert_eq!(u32::from_be_bytes(out[9..13].try_into().unwrap()), 7);
+        assert_eq!(serialize(&accepted, &mut [0u8; 63]), 0);
+
+        let ask = Event::accepted(1, order(Side::Ask));
+        assert_eq!(serialize(&ask, &mut out), 64);
+        assert_eq!(out[13], b'S');
+
+        let cancelled = Event::cancelled(1, order(Side::Bid));
+        assert_eq!(serialize(&cancelled, &mut out), 20);
+        assert_eq!(out[0], b'C');
+        assert_eq!(out[17], b'U');
+        assert_eq!(serialize(&cancelled, &mut [0u8; 19]), 0);
+
+        let modified = Event::modified(1, order(Side::Ask));
+        assert_eq!(serialize(&modified, &mut out), 19);
+        assert_eq!(out[0], b'M');
+        assert_eq!(out[13], b'S');
+        let modified = Event::modified(1, order(Side::Bid));
+        assert_eq!(serialize(&modified, &mut out), 19);
+        assert_eq!(out[13], b'B');
+        assert_eq!(serialize(&modified, &mut [0u8; 18]), 0);
+
+        let rejected = Event::rejected(
+            1,
+            EventReject {
+                user_ref: 7,
+                reason: 4,
+                cl_ord_id: [b'R'; 14],
+            },
+        );
+        assert_eq!(serialize(&rejected, &mut out), 32);
+        assert_eq!(out[0], b'J');
+        assert_eq!(&out[15..29], &[b'R'; 14]);
+        assert_eq!(u16::from_be_bytes(out[13..15].try_into().unwrap()), 4);
+        assert_eq!(serialize(&rejected, &mut [0u8; 31]), 0);
+
+        let trade = Event::trade(
+            1,
+            EventTrade {
+                match_number: 9,
+                maker_exchange_id: 1,
+                maker_user_ref: 7,
+                price: Price(99),
+                quantity: 3,
+                taker_side: Side::Bid,
+            },
+        );
+        assert_eq!(serialize(&trade, &mut out), 38);
+        assert_eq!(out[0], b'E');
+        assert_eq!(serialize(&trade, &mut [0u8; 37]), 0);
+
+        let reset = Event::reset();
+        assert_eq!(reset.ty, EventType::BookReset);
+        assert_eq!(serialize(&reset, &mut out), 0);
+
+        let mut ouch = Ouch;
+        assert_eq!(ouch.encode_event(&accepted, &mut out), 64);
+    }
+}

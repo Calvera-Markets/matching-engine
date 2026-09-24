@@ -46,6 +46,12 @@ test-fix *FLAGS:
 test-sbe *FLAGS:
     cargo test --features sbe {{FLAGS}}
 
+# Reports test coverage and writes badges/coverage.svg. Requires cargo-llvm-cov.
+coverage *FLAGS:
+    cargo llvm-cov {{FLAGS}}
+    cargo llvm-cov report --json --summary-only --output-path target/coverage-summary.json
+    python3 scripts/coverage_badge.py target/coverage-summary.json badges/coverage.svg
+
 # OUCH in, ITCH out. Args pass through (--port, --wal, --cpu-*).
 run *FLAGS:
     cargo run --release -- {{FLAGS}}

@@ -145,4 +145,46 @@ mod tests {
         assert_eq!(dec.match_number(), 9);
         assert_eq!(dec.quantity(), 3);
     }
+
+    #[test]
+    fn ask_delete_and_skipped_events() {
+        use crate::codec::sbe::market_data::DeleteDecoder;
+        use crate::types::EventReject;
+
+        let mut md = SbeMd::new(b"ABCDEFGHIJ");
+        let ask = Event::accepted(
+            1,
+            EventOrder {
+                order_id: 7,
+                user_ref: 1,
+                price: Price(5),
+                quantity: 1,
+                side: Side::Ask,
+                order_state: b'L',
+                cl_ord_id: [b' '; 14],
+            },
+        );
+        assert!(md.push(&ask));
+        let bytes = md.take().unwrap().to_vec();
+        let dec = AddDecoder::wrap(&bytes, MessageHeader::ENCODED_LENGTH, 0);
+        assert_eq!(dec.side(), SbeSide::Sell);
+        assert!(dec.symbol_as_str().starts_with("ABCDEFG"));
+
+        let cancel = Event::cancelled(1, ask.order);
+        assert!(md.push(&cancel));
+        let bytes = md.take().unwrap().to_vec();
+        let dec = DeleteDecoder::wrap(&bytes, MessageHeader::ENCODED_LENGTH, 0);
+        assert_eq!(dec.order_id(), 7);
+
+        let skip = Event::rejected(
+            1,
+            EventReject {
+                user_ref: 1,
+                reason: 0,
+                cl_ord_id: [b' '; 14],
+            },
+        );
+        assert!(md.push(&skip));
+        assert!(md.take().is_none());
+    }
 }

@@ -208,3 +208,66 @@ fn empty_reject() -> EventReject {
         cl_ord_id: [b' '; 14],
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use calvera_books::{Price, Side};
+
+    #[test]
+    fn command_builders_and_the_client_key() {
+        let add = Command::blank(CommandType::Add);
+        assert_eq!(add.ty, CommandType::Add);
+        assert_eq!(add.side, Side::Bid);
+        assert_eq!(Command::poison().ty, CommandType::Poison);
+        assert_eq!(Command::reset().ty, CommandType::Reset);
+        assert_eq!(add.composite_key(), composite_key(1, 0));
+        assert_eq!(composite_key(7, 3), (7u64 << 32) | 3);
+    }
+
+    #[test]
+    fn each_event_constructor_sets_its_type() {
+        let order = EventOrder {
+            order_id: 1,
+            user_ref: 2,
+            price: Price(3),
+            quantity: 4,
+            side: Side::Ask,
+            order_state: b'L',
+            cl_ord_id: [b'Z'; 14],
+        };
+        assert_eq!(Event::accepted(1, order).ty, EventType::OrderAccepted);
+        assert_eq!(Event::cancelled(1, order).ty, EventType::OrderCancelled);
+        assert_eq!(Event::modified(1, order).ty, EventType::OrderModified);
+        assert_eq!(
+            Event::rejected(
+                1,
+                EventReject {
+                    user_ref: 2,
+                    reason: 5,
+                    cl_ord_id: [b'Z'; 14],
+                },
+            )
+            .ty,
+            EventType::OrderRejected
+        );
+        assert_eq!(
+            Event::trade(
+                1,
+                EventTrade {
+                    match_number: 1,
+                    maker_exchange_id: 2,
+                    maker_user_ref: 3,
+                    price: Price(4),
+                    quantity: 5,
+                    taker_side: Side::Bid,
+                },
+            )
+            .ty,
+            EventType::TradeExecuted
+        );
+        let reset = Event::reset();
+        assert_eq!(reset.ty, EventType::BookReset);
+        assert_eq!(reset.client_fd, -1);
+    }
+}
