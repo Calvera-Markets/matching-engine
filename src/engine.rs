@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use calvera_books::{BookError, OrderBook, OrderHandle, Price, Side, VecConsumer};
 
+use crate::balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
+use crate::entry::Entry;
+use crate::reject;
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventOrder, EventReject, EventTrade};
 use crate::wal::Wal;
@@ -22,7 +25,7 @@ struct Live {
     user_ref: u32,
 }
 
-pub struct MatchingEngine {
+pub struct MatchingEngine<B: BalanceCheck = NoCheck> {
     cmds: Arc<Spsc<Command>>,
     ouch: Arc<Spsc<Event>>,
     itch: Arc<Spsc<Event>>,
@@ -34,9 +37,10 @@ pub struct MatchingEngine {
     publish: bool,
     wal_enabled: bool,
     slab: usize,
+    check: B,
 }
 
-impl MatchingEngine {
+impl MatchingEngine<NoCheck> {
     pub fn new(
         cmds: Arc<Spsc<Command>>,
         ouch: Arc<Spsc<Event>>,
@@ -55,6 +59,22 @@ impl MatchingEngine {
         slab: usize,
         wal_size: usize,
     ) -> std::io::Result<Self> {
+        MatchingEngine::with_check(cmds, ouch, itch, wal_path, slab, wal_size, NoCheck)
+    }
+}
+
+impl<B: BalanceCheck> MatchingEngine<B> {
+    /// Open an engine whose orders and entries go through `check`. The WAL is
+    /// replayed through the same hooks, so `check` is rebuilt before this returns.
+    pub fn with_check(
+        cmds: Arc<Spsc<Command>>,
+        ouch: Arc<Spsc<Event>>,
+        itch: Arc<Spsc<Event>>,
+        wal_path: &Path,
+        slab: usize,
+        wal_size: usize,
+        check: B,
+    ) -> std::io::Result<Self> {
         let mut engine = Self {
             cmds,
             ouch,
@@ -67,9 +87,10 @@ impl MatchingEngine {
             publish: false,
             wal_enabled: true,
             slab,
+            check,
         };
         let mut recovered = Vec::new();
-        engine.wal.recover(|cmd| recovered.push(cmd));
+        engine.wal.recover(|cmd| recovered.push(cmd))?;
         for cmd in recovered {
             engine.apply(&cmd);
         }
@@ -104,6 +125,16 @@ impl MatchingEngine {
         self.wal_enabled = on;
     }
 
+    pub fn check(&self) -> &B {
+        &self.check
+    }
+
+    /// Mutable access for draining outputs the check buffers between steps.
+    /// State changes that must survive replay belong in journalled entries.
+    pub fn check_mut(&mut self) -> &mut B {
+        &mut self.check
+    }
+
     pub fn drain_events(&mut self) -> usize {
         let mut n = 0;
         while self.ouch.pop().is_some() {
@@ -121,6 +152,7 @@ impl MatchingEngine {
             CommandType::Cancel => self.cancel(cmd),
             CommandType::Modify => self.modify(cmd),
             CommandType::Reset => self.reset(),
+            CommandType::Entry => self.check.apply_entry(&Entry::from_command(cmd)),
             CommandType::Poison => {}
         }
     }
@@ -128,7 +160,21 @@ impl MatchingEngine {
     fn add(&mut self, cmd: &Command) {
         let key = cmd.composite_key();
         if self.by_client.contains_key(&key) {
-            self.reject(cmd, 0);
+            self.reject(cmd, reject::DUPLICATE_KEY);
+            return;
+        }
+        let order = OrderRef {
+            client_fd: cmd.client_fd,
+            user_ref: cmd.user_ref,
+        };
+        let placed = self.check.on_place(&PlaceCtx {
+            order,
+            side: cmd.side,
+            price: cmd.price,
+            quantity: cmd.quantity,
+        });
+        if let Err(err) = placed {
+            self.reject(cmd, reject::check(B::reject_code(err)));
             return;
         }
 
@@ -149,9 +195,20 @@ impl MatchingEngine {
                     self.by_handle.insert(handle, key);
                     self.by_client.insert(key, live);
                     self.accept(cmd, handle, remaining, b'L');
+                } else {
+                    self.check.on_done(order);
                 }
             }
-            Err(err) => self.reject(cmd, u16::from(err == BookError::SlabFull)),
+            Err(err) => {
+                // Matching ran before the rest failed: report those fills too.
+                self.publish_fills(cmd);
+                self.check.on_done(order);
+                let reason = match err {
+                    BookError::SlabFull => reject::SLAB_FULL,
+                    _ => reject::BOOK_FAULT,
+                };
+                self.reject(cmd, reason);
+            }
         }
     }
 
@@ -162,6 +219,10 @@ impl MatchingEngine {
         };
         self.by_handle.remove(&live.handle);
         let _ = self.book.cancel_limit_order(live.handle);
+        self.check.on_done(OrderRef {
+            client_fd: live.client_fd,
+            user_ref: live.user_ref,
+        });
         self.emit_cancelled(&live);
     }
 
@@ -177,6 +238,7 @@ impl MatchingEngine {
         self.by_client.clear();
         self.by_handle.clear();
         self.book = OrderBook::new(self.slab);
+        self.check.on_reset();
         self.next_match = 1;
         if self.publish {
             self.ouch.push(Event::reset());
@@ -201,6 +263,24 @@ impl MatchingEngine {
                 if dead {
                     self.by_client.remove(&key);
                     self.by_handle.remove(&fill.resting_id);
+                }
+                let maker_ref = OrderRef {
+                    client_fd: maker_fd,
+                    user_ref: uref,
+                };
+                self.check.on_fill(&FillCtx {
+                    match_number: self.next_match,
+                    taker: OrderRef {
+                        client_fd: taker.client_fd,
+                        user_ref: taker.user_ref,
+                    },
+                    taker_side: taker.side,
+                    maker: maker_ref,
+                    price: px,
+                    quantity: fill.quantity,
+                });
+                if dead {
+                    self.check.on_done(maker_ref);
                 }
                 let match_no = self.next_match;
                 self.next_match += 1;

@@ -11,6 +11,8 @@ use calvera_books::{Price, Side};
 const WAL_MAGIC: u32 = 0x214C_4157; // "WAL!"
 pub const WAL_SIZE: usize = 2 * 1024 * 1024 * 1024;
 const FRAME: usize = 64;
+/// Frame layout version. Frames with any other version are refused on recovery.
+pub const WAL_VERSION: u8 = 1;
 
 #[repr(C, align(64))]
 struct WalFrame {
@@ -20,7 +22,8 @@ struct WalFrame {
     // packed command (not the Rust layout)
     ty: u8,
     side: u8,
-    _pad: [u8; 6],
+    version: u8,
+    _pad: [u8; 5],
     price: u64,
     quantity: u64,
     client_fd: i32,
@@ -93,7 +96,9 @@ impl Wal {
         self.offset += FRAME;
     }
 
-    pub fn recover(&mut self, mut visit: impl FnMut(Command)) {
+    /// Replay every valid frame in order. A frame written with another
+    /// layout version is an error: it is refused, never misread.
+    pub fn recover(&mut self, mut visit: impl FnMut(Command)) -> io::Result<()> {
         let mut offset = 0;
         let mut seq = 0u64;
         while offset + FRAME <= self.len {
@@ -105,12 +110,22 @@ impl Wal {
             if got != frame.checksum {
                 break;
             }
+            if frame.version != WAL_VERSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL frame {} has version {}, expected {WAL_VERSION}",
+                        frame.seq, frame.version
+                    ),
+                ));
+            }
             visit(unpack(&frame));
             seq = frame.seq;
             offset += FRAME;
         }
         self.seq = seq;
         self.offset = offset;
+        Ok(())
     }
 }
 
@@ -129,7 +144,8 @@ fn pack(cmd: &Command, seq: u64) -> WalFrame {
         seq,
         ty: cmd.ty as u8,
         side: cmd.side as u8,
-        _pad: [0; 6],
+        version: WAL_VERSION,
+        _pad: [0; 5],
         price: cmd.price.0,
         quantity: cmd.quantity,
         client_fd: cmd.client_fd,
@@ -149,6 +165,7 @@ fn unpack(frame: &WalFrame) -> Command {
             1 => CommandType::Modify,
             2 => CommandType::Cancel,
             3 => CommandType::Reset,
+            5 => CommandType::Entry,
             _ => CommandType::Poison,
         },
         side: if frame.side == 0 {
@@ -212,7 +229,7 @@ mod tests {
         let wal = TempWal::new("roundtrip");
         let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
         let mut none = 0;
-        w.recover(|_| none += 1);
+        w.recover(|_| none += 1).unwrap();
         assert_eq!(none, 0);
 
         let written = [
@@ -221,6 +238,7 @@ mod tests {
             sample(CommandType::Cancel, Side::Bid, 2),
             sample(CommandType::Reset, Side::Ask, 3),
             sample(CommandType::Poison, Side::Bid, 4),
+            sample(CommandType::Entry, Side::Bid, 5),
         ];
         for cmd in &written {
             w.write(cmd);
@@ -228,15 +246,16 @@ mod tests {
         assert_eq!(w.bytes_written(), written.len() * FRAME);
 
         let mut got = Vec::new();
-        w.recover(|cmd| got.push(cmd));
+        w.recover(|cmd| got.push(cmd)).unwrap();
         assert_eq!(got.len(), written.len());
         assert_eq!(got[4].ty, CommandType::Poison);
+        assert_eq!(got[5].ty, CommandType::Entry);
         assert_eq!(got[1].side, Side::Ask);
         unsafe {
             *w.ptr.add(4 * FRAME + 16) = 0xAB;
         }
         got.clear();
-        w.recover(|cmd| got.push(cmd));
+        w.recover(|cmd| got.push(cmd)).unwrap();
         assert_eq!(got.len(), 4);
         assert_eq!(w.bytes_written(), 4 * FRAME);
         for (got, want) in got.iter().zip(written.iter()) {
@@ -251,6 +270,25 @@ mod tests {
             assert_eq!(got.cl_ord_id, want.cl_ord_id);
             assert_eq!(got.capacity, 0);
         }
+    }
+
+    #[test]
+    fn a_frame_from_another_layout_version_is_refused() {
+        let wal = TempWal::new("version");
+        let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
+        w.write(&sample(CommandType::Add, Side::Bid, 1));
+        w.write(&sample(CommandType::Add, Side::Ask, 2));
+        unsafe {
+            let at = w.ptr.add(FRAME) as *mut WalFrame;
+            let mut frame = ptr::read_unaligned(at);
+            frame.version = WAL_VERSION.wrapping_add(1);
+            frame.checksum = checksum(&frame);
+            ptr::write_unaligned(at, frame);
+        }
+        let mut got = 0;
+        let err = w.recover(|_| got += 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(got, 1);
     }
 
     #[test]
