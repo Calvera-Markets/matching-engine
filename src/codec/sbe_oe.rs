@@ -291,6 +291,7 @@ mod tests {
                 side: Side::Bid,
                 order_state: b'L',
                 cl_ord_id: [b' '; 14],
+                cancel_reason: 0,
             },
         );
         let mut out = [0u8; 128];
@@ -385,6 +386,7 @@ mod tests {
                 side: Side::Ask,
                 order_state: b'4',
                 cl_ord_id: [b' '; 14],
+                cancel_reason: 0,
             },
         );
         let n = oe.encode_event(&cancelled, &mut out);
@@ -401,6 +403,7 @@ mod tests {
                 side: Side::Bid,
                 order_state: b'5',
                 cl_ord_id: [b' '; 14],
+                cancel_reason: 0,
             },
         );
         let n = oe.encode_event(&modified, &mut out);

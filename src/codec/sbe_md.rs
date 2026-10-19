@@ -104,6 +104,7 @@ mod tests {
                 side: Side::Bid,
                 order_state: b'L',
                 cl_ord_id: [b' '; 14],
+                cancel_reason: 0,
             },
         );
         assert!(md.push(&evt));
@@ -162,6 +163,7 @@ mod tests {
                 side: Side::Ask,
                 order_state: b'L',
                 cl_ord_id: [b' '; 14],
+                cancel_reason: 0,
             },
         );
         assert!(md.push(&ask));

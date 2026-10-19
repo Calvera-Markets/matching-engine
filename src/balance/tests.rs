@@ -24,6 +24,7 @@ enum Call {
 struct Recorder {
     max_qty: u64,
     calls: Vec<Call>,
+    pending: Vec<crate::balance::BalanceOutput>,
 }
 
 impl BalanceCheck for Recorder {
@@ -47,6 +48,15 @@ impl BalanceCheck for Recorder {
 
     fn apply_entry(&mut self, entry: &Entry) {
         self.calls.push(Call::Entry(*entry));
+        self.pending.push(crate::balance::BalanceOutput::Ack(
+            crate::types::EventBalanceAck {
+                channel: entry.channel,
+                seq: entry.words[3],
+                engine_seq: 0,
+                kind: 0,
+                reason: 0,
+            },
+        ));
     }
 
     fn on_reset(&mut self) {
@@ -65,6 +75,10 @@ impl BalanceCheck for Recorder {
     fn write_snapshot(&self, out: &mut crate::hash::SnapshotSink) {
         out.write_u64(self.max_qty);
     }
+
+    fn take_outputs(&mut self) -> Vec<crate::balance::BalanceOutput> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 type Rig = (MatchingEngine<Recorder>, Arc<Spsc<Event>>);
@@ -81,6 +95,7 @@ fn open(wal: &TempWal, slab: usize, max_qty: u64) -> Rig {
         Recorder {
             max_qty,
             calls: Vec::new(),
+            pending: Vec::new(),
         },
     )
     .unwrap();
@@ -211,4 +226,30 @@ fn entries_are_journalled_and_replayed_through_the_check() {
     assert_eq!(live.last(), Some(&Call::Reset));
     let (eng, _) = open(&wal, 64, 100);
     assert_eq!(eng.check().calls, live);
+}
+
+#[test]
+fn cancel_reason_constants_are_stable() {
+    assert_eq!(crate::cancel_reason::NONE, 0);
+    assert_eq!(crate::cancel_reason::MAKER_UNCOVERED, 0x0200);
+    assert_eq!(crate::cancel_reason::TAKER_UNCOVERED, 0x0201);
+}
+
+#[test]
+fn entry_emits_a_balance_ack_on_the_private_ring() {
+    let wal = TempWal::new("ack");
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    let entry = Entry {
+        kind: 1,
+        tag: 0,
+        channel: 9,
+        words: [0, 0, 0, 1],
+    };
+    eng.step(&entry.to_command());
+    let evs: Vec<_> = std::iter::from_fn(|| ouch.pop()).collect();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].ty, EventType::BalanceAck);
+    assert_eq!(evs[0].balance_ack.channel, 9);
+    assert_eq!(evs[0].balance_ack.seq, 1);
+    assert_eq!(evs[0].balance_ack.engine_seq, 1);
 }

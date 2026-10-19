@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use calvera_books::{BookError, OrderBook, OrderHandle, Price, Side, VecConsumer};
 
-use crate::balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
+use crate::balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
 use crate::entry::Entry;
 use crate::hash::{Snapshot, SnapshotSink, StateHash, StateHasher};
 use crate::reject;
@@ -35,6 +35,8 @@ pub struct MatchingEngine<B: BalanceCheck = NoCheck> {
     by_client: HashMap<u64, Live>,
     by_handle: HashMap<OrderHandle, u64>,
     next_match: u64,
+    /// Monotonic sequence stamped on balance acks and changes.
+    next_ack: u64,
     publish: bool,
     wal_enabled: bool,
     slab: usize,
@@ -85,6 +87,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             by_client: HashMap::with_capacity(1 << 20),
             by_handle: HashMap::with_capacity(1 << 20),
             next_match: 1,
+            next_ack: 1,
             publish: false,
             wal_enabled: true,
             slab,
@@ -203,7 +206,10 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             CommandType::Cancel => self.cancel(cmd),
             CommandType::Modify => self.modify(cmd),
             CommandType::Reset => self.reset(),
-            CommandType::Entry => self.check.apply_entry(&Entry::from_command(cmd)),
+            CommandType::Entry => {
+                self.check.apply_entry(&Entry::from_command(cmd));
+                self.emit_balance_outputs();
+            }
             CommandType::Poison => {}
         }
     }
@@ -274,6 +280,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             client_fd: live.client_fd,
             user_ref: live.user_ref,
         });
+        self.emit_balance_outputs();
         self.emit_cancelled(&live);
     }
 
@@ -291,6 +298,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         self.book = OrderBook::new(self.slab);
         self.check.on_reset();
         self.next_match = 1;
+        // NOTE: ack sequence is not reset; standby comparison uses state_hash, not ack ids.
         if self.publish {
             self.ouch.push(Event::reset());
         }
@@ -366,6 +374,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         }
         fills.clear();
         self.book.consumer.fills = fills;
+        self.emit_balance_outputs();
         filled
     }
 
@@ -380,6 +389,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 side: cmd.side,
                 order_state: state,
                 cl_ord_id: cmd.cl_ord_id,
+                cancel_reason: 0,
             },
         ));
     }
@@ -408,6 +418,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 side: live.side,
                 order_state: b'D',
                 cl_ord_id: live.cl_ord_id,
+                cancel_reason: 0,
             },
         ));
     }
@@ -417,7 +428,10 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             return;
         }
         match evt.ty {
-            crate::types::EventType::OrderRejected | crate::types::EventType::BookReset => {
+            crate::types::EventType::OrderRejected
+            | crate::types::EventType::BookReset
+            | crate::types::EventType::BalanceAck
+            | crate::types::EventType::BalanceChanged => {
                 self.ouch.push(evt);
             }
             _ => {
@@ -428,6 +442,28 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 
     /// Private acks go to both counterparties; the public tape gets one print.
+    fn emit_balance_outputs(&mut self) {
+        if !self.publish {
+            // Still drain so buffers do not grow during recovery.
+            let _ = self.check.take_outputs();
+            return;
+        }
+        for out in self.check.take_outputs() {
+            match out {
+                BalanceOutput::Ack(mut ack) => {
+                    ack.engine_seq = self.next_ack;
+                    self.next_ack += 1;
+                    self.ouch.push(Event::balance_ack(ack));
+                }
+                BalanceOutput::Changed(mut ch) => {
+                    ch.engine_seq = self.next_ack;
+                    self.next_ack += 1;
+                    self.ouch.push(Event::balance_changed(ch));
+                }
+            }
+        }
+    }
+
     fn emit_fill(&mut self, taker_fd: i32, maker_fd: i32, trade: EventTrade) {
         if !self.publish {
             return;
