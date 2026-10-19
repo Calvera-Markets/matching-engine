@@ -1,24 +1,19 @@
 //! Matching engine shell around `calvera-books`.
 
-pub mod balance;
 pub mod codec;
 pub mod egress;
 pub mod engine;
-pub mod entry;
 pub mod ingress;
 pub mod md_pub;
-pub mod reject;
 pub mod spsc;
 pub mod types;
 pub mod wal;
 
-pub use balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
 #[cfg(feature = "itch")]
 pub use codec::itch;
 #[cfg(feature = "ouch")]
 pub use codec::ouch;
 pub use engine::MatchingEngine;
-pub use entry::Entry;
 pub use spsc::Spsc;
 pub use types::{Command, CommandType, Event, EventType};
 

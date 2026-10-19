@@ -10,8 +10,6 @@ pub enum CommandType {
     Cancel = 2,
     Reset = 3,
     Poison = 4,
-    /// Journalled entry for the balance check; see `entry::Entry`.
-    Entry = 5,
 }
 
 #[derive(Debug, Clone, Copy)]

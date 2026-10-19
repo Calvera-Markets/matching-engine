@@ -58,12 +58,8 @@ fn bench_mixed(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                if i.is_multiple_of(2) || live.is_empty() {
-                    let side = if next.is_multiple_of(2) {
-                        Side::Bid
-                    } else {
-                        Side::Ask
-                    };
+                if i % 2 == 0 || live.is_empty() {
+                    let side = if next % 2 == 0 { Side::Bid } else { Side::Ask };
                     let px = if side == Side::Bid { mid - 1 } else { mid + 1 };
                     eng.step(&cmd_add(next, side, px, 1));
                     live.push(next);
