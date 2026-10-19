@@ -68,16 +68,14 @@ impl BalanceCheck for Budget {
         err
     }
 
-    fn hash_into(&self, h: &mut crate::hash::StateHasher) {
+    fn write_snapshot(&self, out: &mut crate::snapshot::SnapshotSink) {
         let mut b: Vec<_> = self.budget.iter().collect();
         b.sort_unstable();
         for (fd, v) in b {
-            h.write_i32(*fd);
-            h.write_u64(*v);
+            out.write_i32(*fd);
+            out.write_u64(*v);
         }
     }
-
-    fn write_snapshot(&self, _out: &mut crate::hash::SnapshotSink) {}
 }
 
 fn open(wal: &TempWal) -> (MatchingEngine<Budget>, Arc<Spsc<Event>>) {
@@ -200,7 +198,7 @@ fn uncovered_taker_stops_and_its_remainder_is_cancelled() {
 }
 
 #[test]
-fn gated_replay_rebuilds_the_same_state_hash() {
+fn gated_replay_rebuilds_the_same_snapshot() {
     let wal = TempWal::new("gate-replay");
     let live = {
         let (mut eng, _) = open(&wal);
@@ -210,8 +208,8 @@ fn gated_replay_rebuilds_the_same_state_hash() {
         eng.step(&add(3, 1, Side::Ask, 100, 4));
         eng.step(&add(1, 1, Side::Bid, 100, 5));
         eng.step(&add(4, 1, Side::Bid, 99, 2));
-        eng.state_hash()
+        eng.snapshot()
     };
     let (eng, _) = open(&wal);
-    assert_eq!(eng.state_hash(), live);
+    assert_eq!(eng.snapshot(), live);
 }

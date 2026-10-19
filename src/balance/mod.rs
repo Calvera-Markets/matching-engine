@@ -13,7 +13,7 @@ pub use null::NoCheck;
 use calvera_books::{Price, Side};
 
 use crate::entry::Entry;
-use crate::hash::{SnapshotSink, StateHasher};
+use crate::snapshot::SnapshotSink;
 use crate::types::{EventBalanceAck, EventBalanceChanged};
 
 /// One private output from the balance check after a step.
@@ -102,10 +102,8 @@ pub trait BalanceCheck {
     /// Check-specific reject code, reported as `reject::check(code)`.
     fn reject_code(err: Self::Error) -> u8;
 
-    /// Feed durable check state into the hasher. Transient buffers are skipped.
-    fn hash_into(&self, h: &mut StateHasher);
-
     /// Write durable check state after the book section of a snapshot.
+    /// Transient buffers are skipped.
     fn write_snapshot(&self, out: &mut SnapshotSink);
 
     /// Drain private balance outputs produced by the last `apply_entry` / settle.
