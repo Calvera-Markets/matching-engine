@@ -309,10 +309,13 @@ fn an_entry_the_log_refuses_is_reported_and_not_applied() {
     eng.step(&entry(3).to_command());
     let ev = drain(&ouch);
     assert_eq!(ev.len(), 3);
-    assert_eq!(ev[2].balance_ack.reason, reject::JOURNAL_FULL);
+    assert_eq!(ev[2].balance_ack.reason, reject::JOURNAL_CANCEL_ONLY);
     assert_eq!(ev[2].balance_ack.seq, 3);
     let calls = &eng.check().calls;
-    assert_eq!(calls[2], Call::Refused(entry(3), reject::JOURNAL_FULL));
+    assert_eq!(
+        calls[2],
+        Call::Refused(entry(3), reject::JOURNAL_CANCEL_ONLY)
+    );
     assert_eq!(
         calls.iter().filter(|c| matches!(c, Call::Entry(_))).count(),
         2

@@ -337,6 +337,7 @@ fn main() {
                 epoch: 1,
                 segment_bytes: HEADER + FRAME,
                 spares: 1,
+                reserve_bytes: HEADER + FRAME,
                 preallocate: false,
                 prefault: false,
                 retire_queue: 4,

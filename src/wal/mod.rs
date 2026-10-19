@@ -10,6 +10,7 @@ mod config;
 mod flags;
 mod frame;
 mod header;
+mod mode;
 mod preparer;
 mod recover;
 mod segment;
@@ -24,6 +25,7 @@ pub use config::WalConfig;
 pub use flags::{USAGE as FLAGS_USAGE, WalFlags};
 pub use frame::{FRAME, WAL_VERSION};
 pub use header::{HEADER, SEGMENT_VERSION};
+pub use mode::Mode;
 pub use preparer::WalMonitor;
 pub use segment::Prep;
 pub use stats::WalStats;
@@ -44,6 +46,7 @@ pub struct Wal {
     end: usize,
     seq: u64,
     prev: u32,
+    mode: Mode,
     spares: Spares,
 }
 
@@ -72,16 +75,20 @@ impl Wal {
             end,
             seq: tail.seq,
             prev: tail.prev,
+            mode: Mode::Normal,
             spares,
         })
     }
 
     /// Append one frame. On `Err` nothing was written and the caller must
-    /// not apply the command.
+    /// not apply the command. `CancelOnly` and `Full` are the degraded modes:
+    /// the log never halts and never skips a frame it reported as written.
     #[inline]
     pub fn write(&mut self, cmd: &Command) -> Result<(), WalError> {
-        if self.offset + FRAME > self.end {
-            self.roll()?;
+        if self.mode != Mode::Normal {
+            self.degraded(cmd)?;
+        } else if self.offset + FRAME > self.end {
+            self.roll(cmd)?;
         }
         let frame = WalFrame::pack(cmd, self.seq + 1, self.prev);
         unsafe { frame.write(self.active.at(self.offset)) };
@@ -91,10 +98,52 @@ impl Wal {
         Ok(())
     }
 
-    /// Swap the full segment for a spare. `Full` when no spare is ready.
+    /// The active segment is full: swap in a spare, or fall back to the
+    /// reserve in cancel-only mode, or refuse everything.
     #[cold]
-    fn roll(&mut self) -> Result<(), WalError> {
-        let mut next = self.spares.take().ok_or(WalError::Full)?;
+    fn roll(&mut self, cmd: &Command) -> Result<(), WalError> {
+        if let Some(next) = self.spares.take() {
+            self.swap(next);
+            return Ok(());
+        }
+        self.enter_reserve(cmd)
+    }
+
+    #[cold]
+    fn enter_reserve(&mut self, cmd: &Command) -> Result<(), WalError> {
+        match self.spares.take_reserve() {
+            Some(reserve) => {
+                self.swap(reserve);
+                self.set_mode(Mode::CancelOnly);
+                admit_cancel_only(cmd)
+            }
+            None => {
+                self.set_mode(Mode::RejectAll);
+                Err(WalError::Full)
+            }
+        }
+    }
+
+    /// Leave a degraded mode as soon as a spare is ready; until then apply
+    /// that mode's rule.
+    #[cold]
+    fn degraded(&mut self, cmd: &Command) -> Result<(), WalError> {
+        if self.spares.has_spare()
+            && let Some(next) = self.spares.take()
+        {
+            self.swap(next);
+            self.set_mode(Mode::Normal);
+            return Ok(());
+        }
+        let room = self.offset + FRAME <= self.end;
+        match self.mode {
+            Mode::CancelOnly if room => admit_cancel_only(cmd),
+            Mode::CancelOnly | Mode::RejectAll => self.enter_reserve(cmd),
+            Mode::Normal => Ok(()),
+        }
+    }
+
+    fn swap(&mut self, mut next: Segment) {
         next.activate(SegmentHeader::new(
             self.epoch,
             self.index + 1,
@@ -106,7 +155,17 @@ impl Wal {
         self.offset = HEADER;
         self.end = self.active.end();
         self.spares.retire(done);
-        Ok(())
+    }
+
+    fn set_mode(&mut self, mode: Mode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.spares.set_mode(mode);
+        }
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
     }
 
     /// Sequence of the last journalled command (0 for an empty log).
@@ -129,7 +188,20 @@ impl Wal {
     }
 
     #[cfg(test)]
+    pub(crate) fn spares_wanted(&self) -> usize {
+        self.spares.wanted()
+    }
+
+    #[cfg(test)]
     pub(crate) fn hold_spares(&mut self, held: bool) {
         self.spares.hold(held);
+    }
+}
+
+fn admit_cancel_only(cmd: &Command) -> Result<(), WalError> {
+    if Mode::cancel_only_admits(cmd) {
+        Ok(())
+    } else {
+        Err(WalError::CancelOnly)
     }
 }

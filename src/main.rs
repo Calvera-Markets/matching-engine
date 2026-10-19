@@ -256,6 +256,8 @@ mod tests {
             "65536",
             "--wal-spares",
             "1",
+            "--wal-reserve-bytes",
+            "4096",
             "--wal-preallocate",
             "off",
             "--wal-prefault",

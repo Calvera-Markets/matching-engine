@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use super::config::WalConfig;
 use crate::error::WalError;
 
-pub const USAGE: &str = "--wal-dir DIR --wal-epoch N --wal-segment-bytes N --wal-spares N \
+pub const USAGE: &str = "--wal-dir DIR --wal-epoch N --wal-segment-bytes N --wal-spares N --wal-reserve-bytes N \
 --wal-preallocate on|off --wal-prefault on|off --wal-retire-queue N --wal-seal-sync on|off \
 --wal-preparer-poll-us N --wal-preparer-cpu N|none";
 
@@ -16,6 +16,7 @@ pub struct WalFlags {
     epoch: Option<u64>,
     segment_bytes: Option<usize>,
     spares: Option<usize>,
+    reserve_bytes: Option<usize>,
     preallocate: Option<bool>,
     prefault: Option<bool>,
     retire_queue: Option<usize>,
@@ -31,6 +32,7 @@ impl WalFlags {
             epoch: None,
             segment_bytes: None,
             spares: None,
+            reserve_bytes: None,
             preallocate: None,
             prefault: None,
             retire_queue: None,
@@ -48,6 +50,7 @@ impl WalFlags {
                 | "--wal-epoch"
                 | "--wal-segment-bytes"
                 | "--wal-spares"
+                | "--wal-reserve-bytes"
                 | "--wal-preallocate"
                 | "--wal-prefault"
                 | "--wal-retire-queue"
@@ -63,6 +66,7 @@ impl WalFlags {
             "--wal-epoch" => self.epoch = Some(number(flag, value)?),
             "--wal-segment-bytes" => self.segment_bytes = Some(number(flag, value)?),
             "--wal-spares" => self.spares = Some(number(flag, value)?),
+            "--wal-reserve-bytes" => self.reserve_bytes = Some(number(flag, value)?),
             "--wal-preallocate" => self.preallocate = Some(switch(flag, value)?),
             "--wal-prefault" => self.prefault = Some(switch(flag, value)?),
             "--wal-retire-queue" => self.retire_queue = Some(number(flag, value)?),
@@ -85,6 +89,7 @@ impl WalFlags {
             epoch: need("--wal-epoch", self.epoch)?,
             segment_bytes: need("--wal-segment-bytes", self.segment_bytes)?,
             spares: need("--wal-spares", self.spares)?,
+            reserve_bytes: need("--wal-reserve-bytes", self.reserve_bytes)?,
             preallocate: need("--wal-preallocate", self.preallocate)?,
             prefault: need("--wal-prefault", self.prefault)?,
             retire_queue: need("--wal-retire-queue", self.retire_queue)?,

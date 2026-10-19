@@ -15,7 +15,9 @@ use super::stats::{Counters, WalStats};
 use crate::spsc::Spsc;
 
 struct Shared {
+    want: usize,
     ready: Spsc<Segment>,
+    reserve: Spsc<Segment>,
     retired: Spsc<Segment>,
     stop: AtomicBool,
     held: AtomicBool,
@@ -38,8 +40,8 @@ struct Helper {
     shared: Arc<Shared>,
     dir: PathBuf,
     len: usize,
+    reserve_len: usize,
     prep: Prep,
-    want: usize,
     seal_sync: bool,
     poll: Duration,
     next_name: u64,
@@ -50,7 +52,9 @@ impl Spares {
     /// to the helper.
     pub fn start(cfg: &WalConfig, next_name: u64) -> io::Result<Self> {
         let shared = Arc::new(Shared {
+            want: cfg.spares,
             ready: Spsc::new(cfg.spares.next_power_of_two()),
+            reserve: Spsc::new(1),
             retired: Spsc::new(cfg.retire_queue.next_power_of_two()),
             stop: AtomicBool::new(false),
             held: AtomicBool::new(false),
@@ -60,8 +64,8 @@ impl Spares {
             shared: shared.clone(),
             dir: cfg.dir.clone(),
             len: cfg.segment_bytes,
+            reserve_len: cfg.reserve_bytes,
             prep: cfg.prep(),
-            want: cfg.spares,
             seal_sync: cfg.seal_sync,
             poll: Duration::from_micros(cfg.preparer_poll_us),
             next_name,
@@ -93,6 +97,25 @@ impl Spares {
         seg
     }
 
+    /// Whether a spare is ready, without taking it.
+    #[inline]
+    pub fn has_spare(&self) -> bool {
+        !self.shared.ready.is_empty()
+    }
+
+    /// The emergency reserve segment, if the helper has one ready.
+    pub fn take_reserve(&mut self) -> Option<Segment> {
+        let seg = self.shared.reserve.pop();
+        if seg.is_some() {
+            Counters::bump(&self.shared.counters.reserves_used);
+        }
+        seg
+    }
+
+    pub fn set_mode(&self, mode: super::mode::Mode) {
+        self.shared.counters.set_mode(mode);
+    }
+
     /// Hand a full segment to the helper for flushing and unmapping.
     #[inline]
     pub fn retire(&mut self, done: Segment) {
@@ -106,6 +129,11 @@ impl Spares {
         WalMonitor {
             shared: self.shared.clone(),
         }
+    }
+
+    #[cfg(test)]
+    pub fn wanted(&self) -> usize {
+        self.shared.want
     }
 
     /// Stop preparing new spares (tests drive the log to exhaustion).
@@ -144,9 +172,11 @@ impl Helper {
         self.seal();
     }
 
-    /// Top up the ready queue to `want`.
+    /// Top up the ready queue to `want`, then the reserve slot.
     fn fill(&mut self) -> io::Result<()> {
-        while !self.shared.held.load(Ordering::Acquire) && self.shared.ready.len() < self.want {
+        while !self.shared.held.load(Ordering::Acquire)
+            && self.shared.ready.len() < self.shared.want
+        {
             let seg = Segment::create(&self.dir, self.next_name, self.len, self.prep)?;
             self.next_name += 1;
             if let Err(seg) = self.shared.ready.try_push(seg) {
@@ -154,6 +184,13 @@ impl Helper {
                 break;
             }
             Counters::bump(&self.shared.counters.prepared);
+        }
+        if !self.shared.held.load(Ordering::Acquire) && self.shared.reserve.is_empty() {
+            let seg = Segment::create(&self.dir, self.next_name, self.reserve_len, self.prep)?;
+            self.next_name += 1;
+            if let Err(seg) = self.shared.reserve.try_push(seg) {
+                drop(seg);
+            }
         }
         Ok(())
     }

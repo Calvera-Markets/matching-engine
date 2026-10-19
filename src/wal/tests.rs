@@ -39,15 +39,13 @@ fn open(cfg: &WalConfig) -> Result<(Wal, Vec<Command>), WalError> {
     Ok((w, got))
 }
 
-/// Write, waiting out `Full` while the preparer catches up.
+/// Write once the preparer has every spare ready, so tiny test segments
+/// never outrun it and the log stays in normal mode.
 fn write(w: &mut Wal, cmd: &Command) {
-    loop {
-        match w.write(cmd) {
-            Ok(()) => return,
-            Err(WalError::Full) => std::thread::yield_now(),
-            Err(e) => panic!("{e}"),
-        }
-    }
+    let want = w.spares_wanted();
+    assert!(wait_for(|| w.stats().spares_ready == want));
+    w.write(cmd).unwrap();
+    assert_eq!(w.mode(), Mode::Normal);
 }
 
 fn write_n(cfg: &WalConfig, n: u32) {
@@ -166,9 +164,10 @@ fn blank_spares_are_removed_on_open() {
     let cfg = small(&wal);
     write_n(&cfg, 1);
     let files = || fs::read_dir(&cfg.dir).unwrap().count();
-    assert_eq!(files(), 2);
+    // Active segment, one spare, one reserve.
+    assert_eq!(files(), 3);
     let (w, _) = open(&cfg).unwrap();
-    assert_eq!(files(), 2);
+    assert_eq!(files(), 3);
     assert_eq!(w.stats().spares_ready, 1);
 }
 
@@ -328,7 +327,7 @@ fn full_when_no_spare_is_ready_and_nothing_is_written() {
     for user in 0..(PER * 2) as u32 {
         w.write(&add(user)).unwrap();
     }
-    assert!(matches!(w.write(&add(50)), Err(WalError::Full)));
+    assert!(matches!(w.write(&add(50)), Err(WalError::CancelOnly)));
     assert_eq!(w.seq(), (PER * 2) as u64);
     w.hold_spares(false);
     write(&mut w, &add(51));
@@ -370,6 +369,7 @@ fn flags_build_a_config_and_report_what_is_missing() {
         ("--wal-epoch", "3"),
         ("--wal-segment-bytes", "1_048_576"),
         ("--wal-spares", "2"),
+        ("--wal-reserve-bytes", "65536"),
         ("--wal-preallocate", "on"),
     ] {
         assert!(WalFlags::owns(f));
@@ -433,7 +433,7 @@ fn a_held_preparer_runs_the_log_out_of_spares_and_recovers() {
     for user in 0..(PER * 3) as u32 {
         w.write(&add(user)).unwrap();
     }
-    assert!(matches!(w.write(&add(99)), Err(WalError::Full)));
+    assert!(matches!(w.write(&add(99)), Err(WalError::CancelOnly)));
     let s = w.stats();
     assert_eq!(s.spares_ready, 0);
     assert_eq!(s.no_spare, 1);
@@ -465,4 +465,96 @@ fn wait_for(mut ok: impl FnMut() -> bool) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     false
+}
+
+fn cancel(user: u32) -> Command {
+    sample(CommandType::Cancel, Side::Bid, user)
+}
+
+#[test]
+fn no_spare_falls_back_to_cancel_only_then_reject_all_then_recovers() {
+    let wal = TempWal::new("seg-degraded");
+    let mut cfg = small(&wal);
+    cfg.reserve_bytes = HEADER + 2 * FRAME;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 2) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    assert_eq!(w.mode(), Mode::Normal);
+
+    assert!(matches!(w.write(&add(50)), Err(WalError::CancelOnly)));
+    assert_eq!(w.mode(), Mode::CancelOnly);
+    assert!(matches!(
+        w.write(
+            &crate::entry::Entry {
+                kind: 2,
+                tag: 0,
+                channel: 1,
+                words: [0; 4]
+            }
+            .to_command()
+        ),
+        Err(WalError::CancelOnly)
+    ));
+    assert!(matches!(
+        w.write(&sample(CommandType::Modify, Side::Bid, 1)),
+        Err(WalError::CancelOnly)
+    ));
+    w.write(&cancel(0)).unwrap();
+    w.write(&cancel(1)).unwrap();
+    assert!(matches!(w.write(&cancel(2)), Err(WalError::Full)));
+    assert_eq!(w.mode(), Mode::RejectAll);
+    assert!(matches!(w.write(&add(51)), Err(WalError::Full)));
+    let seq = w.seq();
+    assert_eq!(seq, (PER * 2 + 2) as u64);
+    let s = w.stats();
+    assert_eq!(s.mode, Mode::RejectAll);
+    assert_eq!(s.reserves_used, 1);
+    assert_eq!(s.mode_changes, 2);
+
+    w.hold_spares(false);
+    assert!(wait_for(|| w.stats().spares_ready == 1));
+    w.write(&add(52)).unwrap();
+    assert_eq!(w.mode(), Mode::Normal);
+    assert_eq!(w.stats().mode, Mode::Normal);
+    drop(w);
+
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 2 + 3);
+    assert_eq!(got[PER * 2].ty, CommandType::Cancel);
+    assert_eq!(got[PER * 2 + 1].ty, CommandType::Cancel);
+    assert_eq!(got.last().unwrap().user_ref, 52);
+}
+
+#[test]
+fn a_spare_ends_cancel_only_before_the_reserve_fills() {
+    let wal = TempWal::new("seg-reserve-early");
+    let mut cfg = small(&wal);
+    cfg.reserve_bytes = HEADER + 8 * FRAME;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 2) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    w.write(&cancel(0)).unwrap();
+    assert_eq!(w.mode(), Mode::CancelOnly);
+    w.hold_spares(false);
+    assert!(wait_for(|| w.stats().spares_ready == 1));
+    w.write(&add(60)).unwrap();
+    assert_eq!(w.mode(), Mode::Normal);
+    for user in 61..(61 + PER as u32) {
+        write(&mut w, &add(user));
+    }
+    drop(w);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 2 + 2 + PER);
+}
+
+#[test]
+fn reserve_size_is_validated() {
+    let wal = TempWal::new("seg-reserve-cfg");
+    let mut cfg = small(&wal);
+    cfg.reserve_bytes = FRAME;
+    assert!(matches!(open(&cfg), Err(WalError::Config(_))));
 }
