@@ -11,6 +11,7 @@ pub use null::NoCheck;
 use calvera_books::{Price, Side};
 
 use crate::entry::Entry;
+use crate::hash::{SnapshotSink, StateHasher};
 
 /// Engine identity of an order: the session it came from and its reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -59,6 +60,12 @@ pub trait BalanceCheck {
 
     /// Check-specific reject code, reported as `reject::check(code)`.
     fn reject_code(err: Self::Error) -> u8;
+
+    /// Feed durable check state into the hasher. Transient buffers are skipped.
+    fn hash_into(&self, h: &mut StateHasher);
+
+    /// Write durable check state after the book section of a snapshot.
+    fn write_snapshot(&self, out: &mut SnapshotSink);
 }
 
 #[cfg(test)]

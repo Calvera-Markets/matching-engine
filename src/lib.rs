@@ -5,6 +5,7 @@ pub mod codec;
 pub mod egress;
 pub mod engine;
 pub mod entry;
+pub mod hash;
 pub mod ingress;
 pub mod md_pub;
 pub mod reject;
@@ -19,6 +20,7 @@ pub use codec::itch;
 pub use codec::ouch;
 pub use engine::MatchingEngine;
 pub use entry::Entry;
+pub use hash::{Snapshot, SnapshotSink, StateHash, StateHasher};
 pub use spsc::Spsc;
 pub use types::{Command, CommandType, Event, EventType};
 

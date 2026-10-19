@@ -56,6 +56,15 @@ impl BalanceCheck for Recorder {
     fn reject_code(err: u8) -> u8 {
         err
     }
+
+    fn hash_into(&self, h: &mut crate::hash::StateHasher) {
+        h.write_u64(self.max_qty);
+        h.write_u64(self.calls.len() as u64);
+    }
+
+    fn write_snapshot(&self, out: &mut crate::hash::SnapshotSink) {
+        out.write_u64(self.max_qty);
+    }
 }
 
 type Rig = (MatchingEngine<Recorder>, Arc<Spsc<Event>>);
