@@ -16,6 +16,7 @@ enum Call {
     Fill(FillCtx),
     Done(OrderRef),
     Entry(Entry),
+    Refused(Entry, u16),
     Reset,
 }
 
@@ -59,6 +60,19 @@ impl BalanceCheck for Recorder {
         ));
     }
 
+    fn refuse_entry(&mut self, entry: &Entry, reason: u16) {
+        self.calls.push(Call::Refused(*entry, reason));
+        self.pending.push(crate::balance::BalanceOutput::Ack(
+            crate::types::EventBalanceAck {
+                channel: entry.channel,
+                seq: entry.words[3],
+                engine_seq: 0,
+                kind: 0,
+                reason,
+            },
+        ));
+    }
+
     fn on_reset(&mut self) {
         self.calls.push(Call::Reset);
     }
@@ -79,6 +93,10 @@ impl BalanceCheck for Recorder {
 type Rig = (MatchingEngine<Recorder>, Arc<Spsc<Event>>);
 
 fn open(wal: &TempWal, slab: usize, max_qty: u64) -> Rig {
+    open_sized(wal, slab, max_qty, 64 * 1024)
+}
+
+fn open_sized(wal: &TempWal, slab: usize, max_qty: u64, wal_bytes: usize) -> Rig {
     let ouch = Arc::new(Spsc::new(256));
     let eng = MatchingEngine::with_check(
         Arc::new(Spsc::new(8)),
@@ -86,7 +104,7 @@ fn open(wal: &TempWal, slab: usize, max_qty: u64) -> Rig {
         Arc::new(Spsc::new(256)),
         &wal.0,
         slab,
-        64 * 1024,
+        wal_bytes,
         Recorder {
             max_qty,
             calls: Vec::new(),
@@ -247,4 +265,55 @@ fn entry_emits_a_balance_ack_on_the_private_ring() {
     assert_eq!(evs[0].balance_ack.channel, 9);
     assert_eq!(evs[0].balance_ack.seq, 1);
     assert_eq!(evs[0].balance_ack.engine_seq, 1);
+}
+
+fn entry(seq: u64) -> Entry {
+    Entry {
+        kind: 1,
+        tag: 0,
+        channel: 9,
+        words: [0, 0, 0, seq],
+    }
+}
+
+fn acks(q: &Spsc<Event>) -> Vec<u64> {
+    drain(q)
+        .iter()
+        .filter(|e| e.ty == EventType::BalanceAck)
+        .map(|e| e.balance_ack.engine_seq)
+        .collect()
+}
+
+#[test]
+fn ack_sequence_continues_after_a_restart() {
+    let wal = TempWal::new("ack-restart");
+    {
+        let (mut eng, ouch) = open(&wal, 64, 100);
+        eng.step(&entry(1).to_command());
+        eng.step(&entry(2).to_command());
+        assert_eq!(acks(&ouch), vec![1, 2]);
+    }
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    assert!(drain(&ouch).is_empty());
+    eng.step(&entry(3).to_command());
+    assert_eq!(acks(&ouch), vec![3]);
+}
+
+#[test]
+fn an_entry_the_log_refuses_is_reported_and_not_applied() {
+    let wal = TempWal::new("ack-full");
+    let (mut eng, ouch) = open_sized(&wal, 64, 100, 128);
+    eng.step(&entry(1).to_command());
+    eng.step(&entry(2).to_command());
+    eng.step(&entry(3).to_command());
+    let ev = drain(&ouch);
+    assert_eq!(ev.len(), 3);
+    assert_eq!(ev[2].balance_ack.reason, reject::JOURNAL_FULL);
+    assert_eq!(ev[2].balance_ack.seq, 3);
+    let calls = &eng.check().calls;
+    assert_eq!(calls[2], Call::Refused(entry(3), reject::JOURNAL_FULL));
+    assert_eq!(
+        calls.iter().filter(|c| matches!(c, Call::Entry(_))).count(),
+        2
+    );
 }

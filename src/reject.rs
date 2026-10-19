@@ -6,6 +6,10 @@ pub const DUPLICATE_KEY: u16 = 0;
 pub const SLAB_FULL: u16 = 1;
 /// The book reported an internal inconsistency.
 pub const BOOK_FAULT: u16 = 2;
+/// The journal could not take the command; it was not applied.
+pub const JOURNAL_FULL: u16 = 3;
+/// The journal failed for another reason; the command was not applied.
+pub const JOURNAL_FAULT: u16 = 4;
 /// Codes at or above this value come from the balance check.
 pub const CHECK_BASE: u16 = 0x0100;
 

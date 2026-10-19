@@ -15,6 +15,7 @@ use gate::EngineGate;
 use crate::balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
 use crate::cancel_reason;
 use crate::entry::Entry;
+use crate::error::WalError;
 use crate::reject;
 use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 use crate::spsc::Spsc;
@@ -57,7 +58,7 @@ impl MatchingEngine<NoCheck> {
         itch: Arc<Spsc<Event>>,
         wal_path: &Path,
         slab: usize,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, WalError> {
         Self::with_wal_size(cmds, ouch, itch, wal_path, slab, crate::wal::WAL_SIZE)
     }
 
@@ -68,7 +69,7 @@ impl MatchingEngine<NoCheck> {
         wal_path: &Path,
         slab: usize,
         wal_size: usize,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, WalError> {
         MatchingEngine::with_check(cmds, ouch, itch, wal_path, slab, wal_size, NoCheck)
     }
 }
@@ -84,7 +85,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         slab: usize,
         wal_size: usize,
         check: B,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, WalError> {
         let mut engine = Self {
             cmds,
             ouch,
@@ -124,15 +125,35 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         }
     }
 
-    /// One engine beat: optional WAL, then apply. Events sit on the rings
-    /// until `drain_events` (or the egress / ITCH threads) pop them.
+    /// One engine beat: WAL, then apply. A command the WAL refuses is
+    /// rejected and not applied, so live state never runs ahead of the log.
+    /// Events sit on the rings until `drain_events` (or the egress / ITCH
+    /// threads) pop them.
     pub fn step(&mut self, cmd: &Command) {
-        if self.wal_enabled && cmd.ty != CommandType::Poison {
-            self.wal.write(cmd);
+        if self.wal_enabled
+            && cmd.ty != CommandType::Poison
+            && let Err(err) = self.wal.write(cmd)
+        {
+            self.refuse(cmd, journal_reject(&err));
+            return;
         }
         self.apply(cmd);
     }
 
+    /// Answer a command that was not journalled. Entries go back through the
+    /// check, which owns their acks; orders get a reject.
+    fn refuse(&mut self, cmd: &Command, reason: u16) {
+        match cmd.ty {
+            CommandType::Entry => {
+                self.check.refuse_entry(&Entry::from_command(cmd), reason);
+                self.emit_balance_outputs();
+            }
+            _ => self.reject(cmd, reason),
+        }
+    }
+
+    /// Turn journalling off for throughput measurements. With it off nothing
+    /// is durable and replay cannot rebuild state.
     pub fn set_wal(&mut self, on: bool) {
         self.wal_enabled = on;
     }
@@ -481,8 +502,9 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     /// Private acks go to both counterparties; the public tape gets one print.
     fn emit_balance_outputs(&mut self) {
         if !self.publish {
-            // Still drain so buffers do not grow during recovery.
-            let _ = self.check.take_outputs();
+            // Replay drains without publishing, but the ack sequence still
+            // advances so numbers consumers already saw are never reissued.
+            self.next_ack += self.check.take_outputs().len() as u64;
             return;
         }
         for out in self.check.take_outputs() {
@@ -511,6 +533,16 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         if maker_fd != taker_fd {
             self.ouch.push(Event::trade(maker_fd, trade));
         }
+    }
+}
+
+fn journal_reject(err: &WalError) -> u16 {
+    match err {
+        WalError::Full => reject::JOURNAL_FULL,
+        WalError::Io(_)
+        | WalError::Version { .. }
+        | WalError::Gap { .. }
+        | WalError::Corrupt { .. } => reject::JOURNAL_FAULT,
     }
 }
 
@@ -599,6 +631,48 @@ mod tests {
         // A different tape gives a different snapshot.
         eng2.step(&order(CommandType::Cancel, 1, 2, Side::Bid, 0, 0));
         assert_ne!(eng2.snapshot(), s1);
+    }
+
+    #[test]
+    fn a_full_log_rejects_and_live_state_matches_replay() {
+        let wal = TempWal::new("full");
+        let open_small = |wal: &TempWal| {
+            let ouch = Arc::new(Spsc::new(256));
+            let eng = MatchingEngine::with_wal_size(
+                Arc::new(Spsc::new(2)),
+                ouch.clone(),
+                Arc::new(Spsc::new(256)),
+                &wal.0,
+                64,
+                4 * 64,
+            )
+            .unwrap();
+            (eng, ouch)
+        };
+        let live = {
+            let (mut eng, ouch) = open_small(&wal);
+            for user in 0..4 {
+                eng.step(&order(
+                    CommandType::Add,
+                    1,
+                    user,
+                    Side::Bid,
+                    100 - user as u64,
+                    1,
+                ));
+            }
+            let _ = pop_all(&ouch);
+            eng.step(&order(CommandType::Add, 1, 9, Side::Bid, 50, 1));
+            let ev = pop_all(&ouch);
+            assert_eq!(ev.len(), 1);
+            assert_eq!(ev[0].ty, EventType::OrderRejected);
+            assert_eq!(ev[0].reject.reason, reject::JOURNAL_FULL);
+            eng.step(&order(CommandType::Cancel, 1, 0, Side::Bid, 0, 0));
+            assert_eq!(pop_all(&ouch)[0].ty, EventType::OrderRejected);
+            eng.snapshot()
+        };
+        let (eng, _) = open_small(&wal);
+        assert_eq!(eng.snapshot(), live);
     }
 
     #[test]
