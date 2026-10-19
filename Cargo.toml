@@ -37,6 +37,11 @@ required-features = ["ouch", "itch"]
 name = "hot"
 harness = false
 
+[[bench]]
+name = "wal_switch"
+path = "benches/wal_switch/main.rs"
+harness = false
+
 [[example]]
 name = "tape_replay"
 path = "examples/tape_replay.rs"

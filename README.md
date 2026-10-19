@@ -40,7 +40,7 @@ Cores default to 8 / 10 / 12 / 14 (`--cpu-ingress` and friends). Pinning is Linu
 
 Same A/C/M stream as the book, but each op is `MatchingEngine::step`. `--codec` encodes each op, runs the engine, then drains private + public rings through the order-entry and market-data codecs.
 
-`just tape` is the 10M synthetic run with the WAL on. `just tape --no-wal` turns the WAL off, and `just tape --no-wal --codec ouch` adds the OUCH and ITCH codec. `just tape-sbe` and `just tape-fix` are the WAL-off SBE and FIX runs. `just bench` is the hot-path bench.
+`just tape` is the 10M synthetic run with the WAL on. `just tape --no-wal` turns the WAL off, and `just tape --no-wal --codec ouch` adds the OUCH and ITCH codec. `just tape-sbe` and `just tape-fix` are the WAL-off SBE and FIX runs. `just bench` is the hot-path bench. `scripts/wal_fs_bench.sh` runs the journal file-switch matrix (filesystem, next-segment prep, inline or threaded journalling) and writes one CSV row per run.
 
 On Apple Silicon, 10M synthetic rest/cancel/modify, `--no-latency`:
 
