@@ -378,7 +378,7 @@ mod tests {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&wal.0)
+            .open(wal.0.join("fd"))
             .unwrap();
         unsafe {
             libc::dup2(file.as_raw_fd(), fd);

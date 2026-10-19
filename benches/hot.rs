@@ -6,9 +6,11 @@ use std::time::Instant;
 
 use calvera_books::{Price, Side};
 use criterion::{Criterion, criterion_group, criterion_main};
+use matching_engine::WalConfig;
 use matching_engine::engine::MatchingEngine;
 use matching_engine::spsc::Spsc;
 use matching_engine::types::{Command, CommandType, Event};
+use matching_engine::wal::{FRAME, HEADER};
 
 fn cmd_add(id: u32, side: Side, price: u64, qty: u64) -> Command {
     let mut c = Command::blank(CommandType::Add);
@@ -26,14 +28,23 @@ fn cmd_cancel(id: u32) -> Command {
 }
 
 fn make_engine(slab: usize) -> MatchingEngine {
-    let wal = std::env::temp_dir().join(format!("me-bench-{}-{}.wal", std::process::id(), slab));
+    let dir = std::env::temp_dir().join(format!("me-bench-{}-{}", std::process::id(), slab));
+    std::fs::create_dir_all(&dir).expect("bench wal dir");
     let cmds = Arc::new(Spsc::<Command>::new(8));
     let ouch = Arc::new(Spsc::<Event>::new(1 << 14));
     let itch = Arc::new(Spsc::<Event>::new(1 << 14));
-    let mut eng =
-        MatchingEngine::with_wal_size(cmds, ouch, itch, &wal, slab, 64 * 1024).expect("engine");
+    // The WAL is switched off below; the log is opened but never written.
+    let wal = WalConfig {
+        dir: dir.clone(),
+        epoch: 1,
+        segment_bytes: HEADER + FRAME,
+        spares: 1,
+        preallocate: false,
+        prefault: false,
+    };
+    let mut eng = MatchingEngine::new(cmds, ouch, itch, &wal, slab).expect("engine");
     eng.set_wal(false);
-    let _ = std::fs::remove_file(wal);
+    let _ = std::fs::remove_dir_all(dir);
     eng
 }
 

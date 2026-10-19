@@ -64,7 +64,7 @@ fix *FLAGS:
 sbe *FLAGS:
     cargo run --release --example sbe --features sbe -- {{FLAGS}}
 
-# 10M synthetic tape, WAL on. Pass --no-wal, or --no-wal --codec ouch.
+# 10M synthetic tape. WAL on needs the --wal-* flags; or pass --no-wal (--codec ouch).
 tape *FLAGS:
     cargo run --release --example tape_replay -- --synthetic 10000000 --no-latency {{FLAGS}}
 

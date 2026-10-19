@@ -4,7 +4,6 @@ mod gate;
 
 use std::collections::HashMap;
 use std::mem;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,7 +19,7 @@ use crate::reject;
 use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventOrder, EventReject, EventTrade};
-use crate::wal::Wal;
+use crate::wal::{Wal, WalConfig};
 
 struct Live {
     handle: OrderHandle,
@@ -56,21 +55,10 @@ impl MatchingEngine<NoCheck> {
         cmds: Arc<Spsc<Command>>,
         ouch: Arc<Spsc<Event>>,
         itch: Arc<Spsc<Event>>,
-        wal_path: &Path,
+        wal: &WalConfig,
         slab: usize,
     ) -> Result<Self, WalError> {
-        Self::with_wal_size(cmds, ouch, itch, wal_path, slab, crate::wal::WAL_SIZE)
-    }
-
-    pub fn with_wal_size(
-        cmds: Arc<Spsc<Command>>,
-        ouch: Arc<Spsc<Event>>,
-        itch: Arc<Spsc<Event>>,
-        wal_path: &Path,
-        slab: usize,
-        wal_size: usize,
-    ) -> Result<Self, WalError> {
-        MatchingEngine::with_check(cmds, ouch, itch, wal_path, slab, wal_size, NoCheck)
+        MatchingEngine::with_check(cmds, ouch, itch, wal, slab, NoCheck)
     }
 }
 
@@ -81,17 +69,18 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         cmds: Arc<Spsc<Command>>,
         ouch: Arc<Spsc<Event>>,
         itch: Arc<Spsc<Event>>,
-        wal_path: &Path,
+        wal: &WalConfig,
         slab: usize,
-        wal_size: usize,
         check: B,
     ) -> Result<Self, WalError> {
+        let mut recovered = Vec::new();
+        let wal = Wal::open(wal, |cmd| recovered.push(cmd))?;
         let mut engine = Self {
             cmds,
             ouch,
             itch,
             book: OrderBook::new(slab),
-            wal: Wal::open_sized(wal_path, wal_size)?,
+            wal,
             by_client: HashMap::with_capacity(1 << 20),
             by_handle: HashMap::with_capacity(1 << 20),
             next_match: 1,
@@ -102,8 +91,6 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             check,
             uncovered: Vec::new(),
         };
-        let mut recovered = Vec::new();
-        engine.wal.recover(|cmd| recovered.push(cmd))?;
         for cmd in recovered {
             engine.apply(&cmd);
         }
@@ -156,6 +143,15 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     /// is durable and replay cannot rebuild state.
     pub fn set_wal(&mut self, on: bool) {
         self.wal_enabled = on;
+    }
+
+    pub fn wal(&self) -> &Wal {
+        &self.wal
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_mut(&mut self) -> &mut Wal {
+        &mut self.wal
     }
 
     pub fn check(&self) -> &B {
@@ -539,10 +535,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
 fn journal_reject(err: &WalError) -> u16 {
     match err {
         WalError::Full => reject::JOURNAL_FULL,
-        WalError::Io(_)
-        | WalError::Version { .. }
-        | WalError::Gap { .. }
-        | WalError::Corrupt { .. } => reject::JOURNAL_FAULT,
+        _ => reject::JOURNAL_FAULT,
     }
 }
 
@@ -563,9 +556,9 @@ mod tests {
     use crate::TempWal;
     use crate::spsc::Spsc;
     use crate::types::{Command, CommandType, Event, EventReject, EventType};
+    use crate::wal::{FRAME, HEADER};
     use calvera_books::{Fill, OrderHandle, Price, Side, SlabIndex};
     use std::num::NonZeroU32;
-    use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::Duration;
@@ -599,13 +592,12 @@ mod tests {
         let cmds = Arc::new(Spsc::new(64));
         let ouch = Arc::new(Spsc::new(64));
         let itch = Arc::new(Spsc::new(64));
-        let eng = MatchingEngine::with_wal_size(
+        let eng = MatchingEngine::new(
             cmds.clone(),
             ouch.clone(),
             itch.clone(),
-            &wal.0,
+            &wal.config(64 * 1024),
             slab,
-            64 * 1024,
         )
         .unwrap();
         (eng, cmds, ouch, itch)
@@ -638,20 +630,20 @@ mod tests {
         let wal = TempWal::new("full");
         let open_small = |wal: &TempWal| {
             let ouch = Arc::new(Spsc::new(256));
-            let eng = MatchingEngine::with_wal_size(
+            let mut eng = MatchingEngine::new(
                 Arc::new(Spsc::new(2)),
                 ouch.clone(),
                 Arc::new(Spsc::new(256)),
-                &wal.0,
+                &wal.config(HEADER + 4 * FRAME),
                 64,
-                4 * 64,
             )
             .unwrap();
+            eng.wal.hold_spares(true);
             (eng, ouch)
         };
         let live = {
             let (mut eng, ouch) = open_small(&wal);
-            for user in 0..4 {
+            for user in 0..8 {
                 eng.step(&order(
                     CommandType::Add,
                     1,
@@ -773,17 +765,17 @@ mod tests {
         let (mut eng, _, ouch, _) = open(&wal, 64);
         eng.set_wal(false);
         eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 1));
-        assert_eq!(eng.wal.bytes_written(), 0);
+        assert_eq!(eng.wal.seq(), 0);
         assert_eq!(ouch.pop().unwrap().ty, EventType::OrderAccepted);
 
         eng.set_wal(true);
         eng.step(&order(CommandType::Add, 1, 2, Side::Ask, 101, 1));
-        assert_eq!(eng.wal.bytes_written(), 64);
+        assert_eq!(eng.wal.seq(), 1);
         let _ = pop_all(&ouch);
 
-        let before = eng.wal.bytes_written();
+        let before = eng.wal.seq();
         eng.step(&Command::poison());
-        assert_eq!(eng.wal.bytes_written(), before);
+        assert_eq!(eng.wal.seq(), before);
         assert!(ouch.pop().is_none());
     }
 
@@ -891,28 +883,29 @@ mod tests {
 
     #[test]
     fn missing_wal_directory_fails() {
-        let err = MatchingEngine::with_wal_size(
+        let mut cfg = TempWal::new("missing").config(4096);
+        cfg.dir = std::path::PathBuf::from("/no/such/me-engine-dir");
+        let err = MatchingEngine::new(
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
-            Path::new("/no/such/me-engine-dir/book.wal"),
+            &cfg,
             64,
-            4096,
         );
-        assert!(err.is_err());
+        assert!(matches!(err, Err(WalError::Config(_))));
     }
 
     #[test]
-    fn new_opens_the_default_wal() {
+    fn new_opens_an_empty_wal() {
         let wal = TempWal::new("new");
         let eng = MatchingEngine::new(
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
-            &wal.0,
+            &wal.config(4096),
             64,
         )
         .unwrap();
-        assert_eq!(eng.wal.bytes_written(), 0);
+        assert_eq!(eng.wal().seq(), 0);
     }
 }

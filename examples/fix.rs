@@ -3,7 +3,6 @@
 //!   cargo run -p matching-engine --release --example fix --features fix
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -16,14 +15,15 @@ use matching_engine::engine::MatchingEngine;
 use matching_engine::ingress::Ingress;
 use matching_engine::md_pub::MdPub;
 use matching_engine::types::{Command, Event};
-use matching_engine::{Spsc, lock_memory, pin_to_cpu};
+use matching_engine::wal::FLAGS_USAGE;
+use matching_engine::{Spsc, WalFlags, lock_memory, pin_to_cpu};
 
 const CMD_Q: usize = 1 << 20;
 const EVT_Q: usize = 1 << 20;
 
 struct Config {
     port: u16,
-    wal: PathBuf,
+    wal: WalFlags,
     itch_ip: Ipv4Addr,
     itch_port: u16,
     itch_iface: Ipv4Addr,
@@ -40,7 +40,7 @@ struct Config {
 fn parse_args() -> Config {
     let mut cfg = Config {
         port: 12345,
-        wal: PathBuf::from("orderbook.wal"),
+        wal: WalFlags::new(),
         itch_ip: Ipv4Addr::new(239, 0, 0, 1),
         itch_port: 5000,
         itch_iface: Ipv4Addr::LOCALHOST,
@@ -64,7 +64,13 @@ fn parse_args() -> Config {
         };
         match a.as_str() {
             "-p" | "--port" => cfg.port = take(&mut args).parse().unwrap(),
-            "-w" | "--wal" => cfg.wal = PathBuf::from(take(&mut args)),
+            flag if WalFlags::owns(flag) => {
+                let v = take(&mut args);
+                if let Err(e) = cfg.wal.set(flag, &v) {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
             "--itch-ip" => cfg.itch_ip = take(&mut args).parse().unwrap(),
             "--itch-port" => cfg.itch_port = take(&mut args).parse().unwrap(),
             "--itch-iface" => cfg.itch_iface = take(&mut args).parse().unwrap(),
@@ -78,7 +84,7 @@ fn parse_args() -> Config {
             "--symbol" => cfg.symbol = take(&mut args),
             "-h" | "--help" => {
                 eprintln!(
-                    "fix [--port 12345] [--wal orderbook.wal]\n\
+                    "fix {FLAGS_USAGE}\n[--port 12345]\n\
                      [--sender-comp VENUE] [--target-comp CLIENT] [--symbol AAPL]\n\
                      [--itch-ip 239.0.0.1] [--itch-port 5000] [--itch-iface 127.0.0.1]\n\
                      [--cpu-ingress 8] [--cpu-engine 10] [--cpu-egress 12] [--cpu-itch 14]\n\
@@ -107,11 +113,15 @@ fn main() {
     let private: Arc<Spsc<Event>> = Arc::new(Spsc::new(EVT_Q));
     let public: Arc<Spsc<Event>> = Arc::new(Spsc::new(EVT_Q));
 
+    let wal = cfg.wal.build().unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2);
+    });
     let mut engine = MatchingEngine::new(
         cmds.clone(),
         private.clone(),
         public.clone(),
-        &cfg.wal,
+        &wal,
         cfg.slab,
     )
     .unwrap_or_else(|e| {
