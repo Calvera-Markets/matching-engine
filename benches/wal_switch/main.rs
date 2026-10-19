@@ -6,6 +6,7 @@
 //! journaller thread (`--mode`). See `scripts/wal_fs_bench.sh`.
 
 mod args;
+mod real;
 mod segment;
 mod stats;
 mod writer;
@@ -19,7 +20,8 @@ use std::time::Instant;
 
 use matching_engine::{Spsc, pin_to_cpu};
 
-use args::{Args, Mode, Prep};
+use args::{Args, Impl, Mode, Prep};
+use real::RealWal;
 use segment::{Helper, Segment};
 use stats::{Summary, count_over};
 use writer::Writer;
@@ -46,7 +48,43 @@ fn main() {
     }
 }
 
+/// Either frame writer behind one call.
+enum Journal {
+    Synthetic(Writer),
+    Real(RealWal),
+}
+
+impl Journal {
+    #[inline]
+    fn write(&mut self, seq: u64) -> io::Result<bool> {
+        match self {
+            Journal::Synthetic(w) => w.write(seq),
+            Journal::Real(w) => w.write(seq),
+        }
+    }
+
+    fn finish(self) -> usize {
+        match self {
+            Journal::Synthetic(w) => w.finish(),
+            Journal::Real(w) => w.finish(),
+        }
+    }
+}
+
 fn bench(args: &Args) -> io::Result<()> {
+    if let Impl::Wal { poll_us } = args.writer {
+        let per_segment = (args.segment_bytes - matching_engine::wal::HEADER) / FRAME;
+        let total = per_segment * args.segments;
+        let writer = Journal::Real(RealWal::open(args, poll_us)?);
+        if let Some(cpu) = args.cpu_writer {
+            pin_to_cpu(cpu);
+        }
+        let run = match args.mode {
+            Mode::Inline => inline(writer, args, total)?,
+            Mode::Threaded => threaded(writer, args, total)?,
+        };
+        return report(args, run);
+    }
     let per_segment = args.segment_bytes / FRAME;
     let total = per_segment * args.segments;
     let ready = Arc::new(Spsc::new(args.spares.next_power_of_two()));
@@ -82,7 +120,7 @@ fn bench(args: &Args) -> io::Result<()> {
         thread::yield_now();
     }
 
-    let writer = Writer::new(first, args, ready.clone(), used.clone());
+    let writer = Journal::Synthetic(Writer::new(first, args, ready.clone(), used.clone()));
     if let Some(cpu) = args.cpu_writer {
         pin_to_cpu(cpu);
     }
@@ -117,7 +155,7 @@ fn pace(start: Instant, i: usize, rate: u64) {
     }
 }
 
-fn inline(mut w: Writer, args: &Args, total: usize) -> io::Result<Run> {
+fn inline(mut w: Journal, args: &Args, total: usize) -> io::Result<Run> {
     let mut lat = Vec::with_capacity(total);
     let mut switches = Vec::new();
     let start = Instant::now();
@@ -138,7 +176,7 @@ fn inline(mut w: Writer, args: &Args, total: usize) -> io::Result<Run> {
     })
 }
 
-fn threaded(mut w: Writer, args: &Args, total: usize) -> io::Result<Run> {
+fn threaded(mut w: Journal, args: &Args, total: usize) -> io::Result<Run> {
     let inbox: Arc<Spsc<u64>> = Arc::new(Spsc::new(1 << 16));
     let cursor = Arc::new(AtomicU64::new(0));
     let journal = {
@@ -210,13 +248,17 @@ fn report(args: &Args, run: Run) -> io::Result<()> {
         None => (0, 0),
     };
 
-    let header = "label,fs,prep,mode,segment_bytes,segments,rate,writes,mean_ns,p50_ns,p99_ns,p9999_ns,max_ns,switches,switch_p50_ns,switch_max_ns,window,window_p9999_ns,window_max_ns,over_10us,over_100us,spare_stalls";
+    let header = "label,fs,prep,mode,writer,segment_bytes,segments,rate,writes,mean_ns,p50_ns,p99_ns,p9999_ns,max_ns,switches,switch_p50_ns,switch_max_ns,window,window_p9999_ns,window_max_ns,over_10us,over_100us,spare_stalls";
     let row = format!(
-        "{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         args.label,
         fs,
         args.prep.name(),
         args.mode.name(),
+        match args.writer {
+            Impl::Synthetic => "synthetic",
+            Impl::Wal { .. } => "wal",
+        },
         args.segment_bytes,
         args.segments,
         args.rate,

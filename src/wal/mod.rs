@@ -1,17 +1,19 @@
 //! Segmented mmap WAL. Every command is written before it is applied, and
 //! recovery replays the log in order.
 //!
-//! The log is a chain of fixed-size segment files. When the active segment
-//! fills, the writer swaps in a prepared spare and stamps its header; the
-//! swap itself is a pointer exchange and a 64-byte store.
+//! The log is a chain of fixed-size segment files. A helper thread keeps
+//! blank spares ready and retires full segments. When the active segment
+//! fills, the writer swaps in a spare and stamps its header: a pointer
+//! exchange and a 64-byte store, with no syscall.
 
 mod config;
 mod flags;
 mod frame;
 mod header;
+mod preparer;
 mod recover;
 mod segment;
-mod spares;
+mod stats;
 
 #[cfg(test)]
 mod tests;
@@ -22,12 +24,14 @@ pub use config::WalConfig;
 pub use flags::{USAGE as FLAGS_USAGE, WalFlags};
 pub use frame::{FRAME, WAL_VERSION};
 pub use header::{HEADER, SEGMENT_VERSION};
+pub use preparer::WalMonitor;
 pub use segment::Prep;
+pub use stats::WalStats;
 
 use frame::{CHAIN_SEED, WalFrame};
 use header::SegmentHeader;
+use preparer::Spares;
 use segment::Segment;
-use spares::Spares;
 
 use crate::error::WalError;
 use crate::types::Command;
@@ -49,22 +53,16 @@ impl Wal {
     pub fn open(cfg: &WalConfig, visit: impl FnMut(Command)) -> Result<Self, WalError> {
         cfg.validate()?;
         let tail = recover::recover(cfg, visit)?;
-        let mut spares = Spares::new(
-            cfg.dir.clone(),
-            cfg.segment_bytes,
-            cfg.prep(),
-            cfg.spares,
-            tail.next_name,
-        );
-        spares.fill()?;
-        let (active, index, offset) = match tail.active {
-            Some((seg, h)) => (seg, h.index, tail.offset),
+        let (active, index, offset, next_name) = match tail.active {
+            Some((seg, h)) => (seg, h.index, tail.offset, tail.next_name),
             None => {
-                let mut seg = spares.take().ok_or(WalError::Full)?;
+                let mut seg =
+                    Segment::create(&cfg.dir, tail.next_name, cfg.segment_bytes, cfg.prep())?;
                 seg.activate(SegmentHeader::new(cfg.epoch, 0, 1, CHAIN_SEED));
-                (seg, 0, HEADER)
+                (seg, 0, HEADER, tail.next_name + 1)
             }
         };
+        let spares = Spares::start(cfg, next_name)?;
         let end = active.end();
         Ok(Self {
             epoch: cfg.epoch,
@@ -121,18 +119,17 @@ impl Wal {
         self.index
     }
 
-    /// Spares ready for the next roll.
-    pub fn spares_ready(&self) -> usize {
-        self.spares.ready()
+    /// Handle for reading journal counters from another thread.
+    pub fn monitor(&self) -> WalMonitor {
+        self.spares.monitor()
+    }
+
+    pub fn stats(&self) -> WalStats {
+        self.spares.monitor().stats()
     }
 
     #[cfg(test)]
     pub(crate) fn hold_spares(&mut self, held: bool) {
         self.spares.hold(held);
-    }
-
-    /// Times a spare could not be prepared.
-    pub fn spare_failures(&self) -> u64 {
-        self.spares.failures()
     }
 }

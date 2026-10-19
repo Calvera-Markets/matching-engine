@@ -6,9 +6,11 @@ use super::config::WalConfig;
 use crate::error::WalError;
 
 pub const USAGE: &str = "--wal-dir DIR --wal-epoch N --wal-segment-bytes N --wal-spares N \
---wal-preallocate on|off --wal-prefault on|off";
+--wal-preallocate on|off --wal-prefault on|off --wal-retire-queue N --wal-seal-sync on|off \
+--wal-preparer-poll-us N --wal-preparer-cpu N|none";
 
 /// Collects `--wal-*` flags; `build` fails on any missing one.
+#[derive(Clone)]
 pub struct WalFlags {
     dir: Option<PathBuf>,
     epoch: Option<u64>,
@@ -16,6 +18,10 @@ pub struct WalFlags {
     spares: Option<usize>,
     preallocate: Option<bool>,
     prefault: Option<bool>,
+    retire_queue: Option<usize>,
+    seal_sync: Option<bool>,
+    preparer_poll_us: Option<u64>,
+    preparer_cpu: Option<Option<usize>>,
 }
 
 impl WalFlags {
@@ -27,6 +33,10 @@ impl WalFlags {
             spares: None,
             preallocate: None,
             prefault: None,
+            retire_queue: None,
+            seal_sync: None,
+            preparer_poll_us: None,
+            preparer_cpu: None,
         }
     }
 
@@ -40,6 +50,10 @@ impl WalFlags {
                 | "--wal-spares"
                 | "--wal-preallocate"
                 | "--wal-prefault"
+                | "--wal-retire-queue"
+                | "--wal-seal-sync"
+                | "--wal-preparer-poll-us"
+                | "--wal-preparer-cpu"
         )
     }
 
@@ -51,6 +65,15 @@ impl WalFlags {
             "--wal-spares" => self.spares = Some(number(flag, value)?),
             "--wal-preallocate" => self.preallocate = Some(switch(flag, value)?),
             "--wal-prefault" => self.prefault = Some(switch(flag, value)?),
+            "--wal-retire-queue" => self.retire_queue = Some(number(flag, value)?),
+            "--wal-seal-sync" => self.seal_sync = Some(switch(flag, value)?),
+            "--wal-preparer-poll-us" => self.preparer_poll_us = Some(number(flag, value)?),
+            "--wal-preparer-cpu" => {
+                self.preparer_cpu = Some(match value {
+                    "none" => None,
+                    _ => Some(number(flag, value)?),
+                })
+            }
             _ => return Err(WalError::Config(format!("unknown wal flag {flag}"))),
         }
         Ok(())
@@ -64,6 +87,10 @@ impl WalFlags {
             spares: need("--wal-spares", self.spares)?,
             preallocate: need("--wal-preallocate", self.preallocate)?,
             prefault: need("--wal-prefault", self.prefault)?,
+            retire_queue: need("--wal-retire-queue", self.retire_queue)?,
+            seal_sync: need("--wal-seal-sync", self.seal_sync)?,
+            preparer_poll_us: need("--wal-preparer-poll-us", self.preparer_poll_us)?,
+            preparer_cpu: need("--wal-preparer-cpu", self.preparer_cpu)?,
         })
     }
 }

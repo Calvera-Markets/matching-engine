@@ -41,6 +41,10 @@ fn make_engine(slab: usize) -> MatchingEngine {
         spares: 1,
         preallocate: false,
         prefault: false,
+        retire_queue: 4,
+        seal_sync: false,
+        preparer_poll_us: 100,
+        preparer_cpu: None,
     };
     let mut eng = MatchingEngine::new(cmds, ouch, itch, &wal, slab).expect("engine");
     eng.set_wal(false);

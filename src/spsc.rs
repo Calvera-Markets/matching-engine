@@ -39,6 +39,18 @@ impl<T> Spsc<T> {
         self.mask + 1
     }
 
+    /// Items queued. Exact from the producer or consumer thread; a snapshot
+    /// from anywhere else.
+    pub fn len(&self) -> usize {
+        let tail = self.tail.0.load(Ordering::Acquire);
+        let head = self.head.0.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn push(&self, mut val: T) {
         loop {
             match self.try_push(val) {
@@ -93,7 +105,9 @@ mod tests {
     fn reports_capacity_and_rejects_a_full_ring() {
         let q = Spsc::new(2);
         assert_eq!(q.cap(), 2);
+        assert!(q.is_empty());
         assert!(q.try_push(1).is_ok());
+        assert_eq!(q.len(), 1);
         assert!(q.try_push(2).is_ok());
         assert_eq!(q.try_push(3).err(), Some(3));
         assert_eq!(q.pop(), Some(1));

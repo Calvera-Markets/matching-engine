@@ -23,6 +23,14 @@ pub struct WalConfig {
     pub preallocate: bool,
     /// Touch every page of a spare before the engine gets it.
     pub prefault: bool,
+    /// Full segments queued for the preparer to flush and unmap.
+    pub retire_queue: usize,
+    /// `msync` a full segment before unmapping it.
+    pub seal_sync: bool,
+    /// Preparer sleep between passes when it has nothing to do.
+    pub preparer_poll_us: u64,
+    /// Core to pin the preparer to, or `None` to leave it to the scheduler.
+    pub preparer_cpu: Option<usize>,
 }
 
 impl WalConfig {
@@ -36,6 +44,9 @@ impl WalConfig {
         }
         if self.spares == 0 {
             return Err(WalError::Config("spares must be at least 1".into()));
+        }
+        if self.retire_queue == 0 {
+            return Err(WalError::Config("retire_queue must be at least 1".into()));
         }
         if !self.dir.is_dir() {
             return Err(WalError::Config(format!(

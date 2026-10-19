@@ -28,7 +28,7 @@ pub use error::WalError;
 pub use snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 pub use spsc::Spsc;
 pub use types::{Command, CommandType, Event, EventBalanceAck, EventBalanceChanged, EventType};
-pub use wal::{WalConfig, WalFlags};
+pub use wal::{Wal, WalConfig, WalFlags, WalMonitor, WalStats};
 
 #[inline(always)]
 pub fn pause() {
@@ -74,6 +74,10 @@ impl TempWal {
             spares: 1,
             preallocate: false,
             prefault: false,
+            retire_queue: 4,
+            seal_sync: false,
+            preparer_poll_us: 100,
+            preparer_cpu: None,
         }
     }
 }
