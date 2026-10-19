@@ -112,3 +112,61 @@ impl From<io::Error> for WalError {
         WalError::Io(e)
     }
 }
+
+/// A standby link failure. The replicator retries the same command.
+#[derive(Debug)]
+pub enum ReplicaError {
+    Io(io::Error),
+    /// The standby is unreachable or refused the command.
+    Unavailable(String),
+}
+
+impl fmt::Display for ReplicaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReplicaError::Io(e) => write!(f, "replica io: {e}"),
+            ReplicaError::Unavailable(msg) => write!(f, "replica unavailable: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplicaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReplicaError::Io(e) => Some(e),
+            ReplicaError::Unavailable(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for ReplicaError {
+    fn from(e: io::Error) -> Self {
+        ReplicaError::Io(e)
+    }
+}
+
+/// The gated journal could not start.
+#[derive(Debug)]
+pub enum GateError {
+    /// Configuration from the control plane is missing or unusable.
+    Config(String),
+    Spawn(io::Error),
+}
+
+impl fmt::Display for GateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GateError::Config(msg) => write!(f, "journal gate config: {msg}"),
+            GateError::Spawn(e) => write!(f, "journal gate thread: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for GateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GateError::Spawn(e) => Some(e),
+            GateError::Config(_) => None,
+        }
+    }
+}

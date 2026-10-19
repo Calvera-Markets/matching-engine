@@ -17,7 +17,7 @@ Order-entry and market-data are chosen at compile time (`Ingress<Oe>`, `Egress<O
 - Private egress: ack to whoever sent the order.
 - Public tape: a separate queue, so a slow multicast reader cannot stall.
 
-The book gives each resting order a handle, and cancels, fills, and acks refer to that order by the handle. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. The WAL is a chain of fixed-size mmap segment files. A write is a store into the mapping, with no fsync, so the engine thread does not wait on disk; a power loss can drop the tail the kernel has not flushed. A command the WAL cannot take is rejected, never applied. Recovery checks that sequences and the checksum chain run unbroken across segments.
+The book gives each resting order a handle, and cancels, fills, and acks refer to that order by the handle. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. The WAL is a chain of fixed-size mmap segment files. A write is a store into the mapping, with no fsync, so the engine thread does not wait on disk; a power loss can drop the tail the kernel has not flushed. A command the WAL cannot take is rejected, never applied. Recovery checks that sequences and the checksum chain run unbroken across segments. By default the engine thread journals each command itself; `journal::spawn_gated` instead moves the WAL write to a journaller thread, optionally followed by a replicator, and the engine reads only commands already journalled (and, in sync mode, acknowledged by the standby).
 
 ## Features
 
