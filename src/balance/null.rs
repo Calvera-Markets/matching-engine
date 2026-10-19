@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 
-use super::{BalanceCheck, FillCtx, OrderRef, PlaceCtx};
+use super::{BalanceCheck, FillCtx, MatchCtx, OrderRef, PlaceCtx, Verdict};
 use crate::entry::Entry;
 use crate::hash::{SnapshotSink, StateHasher};
 
@@ -13,6 +13,13 @@ const _: () = assert!(size_of::<NoCheck>() == 0);
 
 impl BalanceCheck for NoCheck {
     type Error = Infallible;
+
+    const GATES: bool = false;
+
+    #[inline(always)]
+    fn admit(&mut self, _fill: &MatchCtx) -> Verdict {
+        Verdict::Fill
+    }
 
     #[inline(always)]
     fn on_place(&mut self, _order: &PlaceCtx) -> Result<(), Self::Error> {
