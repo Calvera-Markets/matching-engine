@@ -67,12 +67,7 @@ impl BalanceCheck for Recorder {
         err
     }
 
-    fn hash_into(&self, h: &mut crate::hash::StateHasher) {
-        h.write_u64(self.max_qty);
-        h.write_u64(self.calls.len() as u64);
-    }
-
-    fn write_snapshot(&self, out: &mut crate::hash::SnapshotSink) {
+    fn write_snapshot(&self, out: &mut crate::snapshot::SnapshotSink) {
         out.write_u64(self.max_qty);
     }
 

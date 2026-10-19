@@ -10,8 +10,8 @@ use calvera_books::{BookError, OrderBook, OrderHandle, Price, Side, VecConsumer}
 
 use crate::balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
 use crate::entry::Entry;
-use crate::hash::{Snapshot, SnapshotSink, StateHash, StateHasher};
 use crate::reject;
+use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventOrder, EventReject, EventTrade};
 use crate::wal::Wal;
@@ -139,51 +139,17 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         &mut self.check
     }
 
-    /// Digest of open orders, match counter, and the balance check.
-    /// Two engines that applied the same log must agree.
-    pub fn state_hash(&self) -> StateHash {
-        let mut h = StateHasher::new();
-        h.tag(0xB00B_0001); // books (open orders as the engine sees them)
-        let mut keys: Vec<u64> = self.by_client.keys().copied().collect();
-        keys.sort_unstable();
-        h.write_u64(keys.len() as u64);
-        for key in keys {
-            let live = &self.by_client[&key];
-            h.write_u64(key);
-            h.write_u64(live.handle.as_u64());
-            h.write_u64(live.price.0);
-            h.write_u64(live.qty);
-            h.write_u8(live.side as u8);
-            h.write_bytes(&live.cl_ord_id);
-            h.write_i32(live.client_fd);
-            h.write_u32(live.user_ref);
-        }
-        h.tag(0xB00B_0002); // match counter
-        h.write_u64(self.next_match);
-        h.tag(0xB00B_0003); // balance check
-        self.check.hash_into(&mut h);
-        h.finish()
-    }
-
     /// Checkpoint of open orders, match counter, and the balance check.
-    /// Order: books → by_client fields → check. See PR 026.
+    /// Layout: version, match counter, open orders sorted by key, check.
     pub fn snapshot(&self) -> Snapshot {
         let mut out = SnapshotSink::new();
-        out.write_u64(1); // snapshot layout version
+        out.write_u64(SNAPSHOT_VERSION);
         out.write_u64(self.next_match);
         let mut keys: Vec<u64> = self.by_client.keys().copied().collect();
         keys.sort_unstable();
         out.write_u64(keys.len() as u64);
         for key in keys {
-            let live = &self.by_client[&key];
-            out.write_u64(key);
-            out.write_u64(live.handle.as_u64());
-            out.write_u64(live.price.0);
-            out.write_u64(live.qty);
-            out.write_u8(live.side as u8);
-            out.write_bytes(&live.cl_ord_id);
-            out.write_i32(live.client_fd);
-            out.write_u32(live.user_ref);
+            write_live(&mut out, key, &self.by_client[&key]);
         }
         self.check.write_snapshot(&mut out);
         out.finish()
@@ -298,7 +264,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         self.book = OrderBook::new(self.slab);
         self.check.on_reset();
         self.next_match = 1;
-        // NOTE: ack sequence is not reset; standby comparison uses state_hash, not ack ids.
+        // NOTE: ack sequence is not reset; standby comparison uses the snapshot, not ack ids.
         if self.publish {
             self.ouch.push(Event::reset());
         }
@@ -477,6 +443,17 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 }
 
+fn write_live(out: &mut SnapshotSink, key: u64, live: &Live) {
+    out.write_u64(key);
+    out.write_u64(live.handle.as_u64());
+    out.write_u64(live.price.0);
+    out.write_u64(live.qty);
+    out.write_u8(live.side as u8);
+    out.write_bytes(&live.cl_ord_id);
+    out.write_i32(live.client_fd);
+    out.write_u32(live.user_ref);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -532,28 +509,25 @@ mod tests {
     }
 
     #[test]
-    fn same_log_same_hash_and_snapshot() {
-        let wal = TempWal::new("hash");
+    fn same_log_same_snapshot() {
+        let wal = TempWal::new("snap");
         let run = |wal: &TempWal| {
             let (mut eng, _, _, _) = open(wal, 64);
             eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
             eng.step(&order(CommandType::Add, 2, 1, Side::Ask, 100, 4));
             eng.step(&order(CommandType::Add, 1, 2, Side::Bid, 99, 3));
-            (eng.state_hash(), eng.snapshot())
+            eng.snapshot()
         };
-        let (h1, s1) = run(&wal);
+        let s1 = run(&wal);
         // Reopen on the same WAL: recovery rebuilds identical state.
         let (mut eng2, _, _, _) = open(&wal, 64);
-        assert_eq!(eng2.state_hash(), h1);
         assert_eq!(eng2.snapshot(), s1);
-        // A second independent run on a fresh WAL with the same tape must match.
-        let wal_b = TempWal::new("hash-b");
-        let (h2, s2) = run(&wal_b);
-        assert_eq!(h1, h2);
-        assert_eq!(s1, s2);
-        // A different tape must not collide (except by chance; this one differs).
+        // An independent run of the same tape on a fresh WAL must match.
+        let wal_b = TempWal::new("snap-b");
+        assert_eq!(run(&wal_b), s1);
+        // A different tape gives a different snapshot.
         eng2.step(&order(CommandType::Cancel, 1, 2, Side::Bid, 0, 0));
-        assert_ne!(eng2.state_hash(), h1);
+        assert_ne!(eng2.snapshot(), s1);
     }
 
     #[test]
