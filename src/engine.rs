@@ -15,6 +15,7 @@ use crate::balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, Pl
 use crate::cancel_reason;
 use crate::entry::Entry;
 use crate::error::WalError;
+use crate::journal::{Inline, Journal, Verdict};
 use crate::reject;
 use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 use crate::spsc::Spsc;
@@ -31,19 +32,17 @@ struct Live {
     user_ref: u32,
 }
 
-pub struct MatchingEngine<B: BalanceCheck = NoCheck> {
-    cmds: Arc<Spsc<Command>>,
+pub struct MatchingEngine<B: BalanceCheck = NoCheck, J: Journal = Inline> {
+    journal: J,
     ouch: Arc<Spsc<Event>>,
     itch: Arc<Spsc<Event>>,
     book: OrderBook<VecConsumer>,
-    wal: Wal,
     by_client: HashMap<u64, Live>,
     by_handle: HashMap<OrderHandle, u64>,
     next_match: u64,
     /// Monotonic sequence stamped on balance acks and changes.
     next_ack: u64,
     publish: bool,
-    wal_enabled: bool,
     slab: usize,
     check: B,
     /// Makers the check cancelled during the current sweep.
@@ -75,18 +74,62 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     ) -> Result<Self, WalError> {
         let mut recovered = Vec::new();
         let wal = Wal::open(wal, |cmd| recovered.push(cmd))?;
+        Ok(MatchingEngine::with_journal(
+            Inline::new(cmds, wal),
+            recovered,
+            ouch,
+            itch,
+            slab,
+            check,
+        ))
+    }
+
+    /// One engine beat: WAL, then apply. A command the WAL refuses is
+    /// rejected and not applied, so live state never runs ahead of the log.
+    /// Events sit on the rings until `drain_events` (or the egress / ITCH
+    /// threads) pop them.
+    pub fn step(&mut self, cmd: &Command) {
+        let verdict = self.journal.record(cmd);
+        self.settle(cmd, verdict);
+    }
+
+    /// Turn journalling off for throughput measurements. With it off nothing
+    /// is durable and replay cannot rebuild state.
+    pub fn set_wal(&mut self, on: bool) {
+        self.journal.set_enabled(on);
+    }
+
+    pub fn wal(&self) -> &Wal {
+        self.journal.wal()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_mut(&mut self) -> &mut Wal {
+        self.journal.wal_mut()
+    }
+}
+
+impl<B: BalanceCheck, J: Journal> MatchingEngine<B, J> {
+    /// Build an engine on `journal`, first replaying `recovered` (the
+    /// commands the journal's WAL held when it was opened) without publishing.
+    pub fn with_journal(
+        journal: J,
+        recovered: Vec<Command>,
+        ouch: Arc<Spsc<Event>>,
+        itch: Arc<Spsc<Event>>,
+        slab: usize,
+        check: B,
+    ) -> Self {
         let mut engine = Self {
-            cmds,
+            journal,
             ouch,
             itch,
             book: OrderBook::new(slab),
-            wal,
             by_client: HashMap::with_capacity(1 << 20),
             by_handle: HashMap::with_capacity(1 << 20),
             next_match: 1,
             next_ack: 1,
             publish: false,
-            wal_enabled: true,
             slab,
             check,
             uncovered: Vec::new(),
@@ -95,36 +138,33 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             engine.apply(&cmd);
         }
         engine.publish = true;
-        Ok(engine)
+        engine
     }
 
     /// Hot loop. Run on a dedicated pinned thread.
     pub fn run(&mut self, running: &AtomicBool) {
         while running.load(Ordering::Relaxed) {
-            let Some(cmd) = self.cmds.pop() else {
+            let Some((cmd, verdict)) = self.journal.next() else {
                 crate::pause();
                 continue;
             };
             if cmd.ty == CommandType::Poison {
                 break;
             }
-            self.step(&cmd);
+            self.settle(&cmd, verdict);
         }
     }
 
-    /// One engine beat: WAL, then apply. A command the WAL refuses is
-    /// rejected and not applied, so live state never runs ahead of the log.
-    /// Events sit on the rings until `drain_events` (or the egress / ITCH
-    /// threads) pop them.
-    pub fn step(&mut self, cmd: &Command) {
-        if self.wal_enabled
-            && cmd.ty != CommandType::Poison
-            && let Err(err) = self.wal.write(cmd)
-        {
-            self.refuse(cmd, journal_reject(&err));
-            return;
+    pub fn journal(&self) -> &J {
+        &self.journal
+    }
+
+    #[inline(always)]
+    fn settle(&mut self, cmd: &Command, verdict: Verdict) {
+        match verdict {
+            Verdict::Apply => self.apply(cmd),
+            Verdict::Refuse(reason) => self.refuse(cmd, reason),
         }
-        self.apply(cmd);
     }
 
     /// Answer a command that was not journalled. Entries go back through the
@@ -137,21 +177,6 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             }
             _ => self.reject(cmd, reason),
         }
-    }
-
-    /// Turn journalling off for throughput measurements. With it off nothing
-    /// is durable and replay cannot rebuild state.
-    pub fn set_wal(&mut self, on: bool) {
-        self.wal_enabled = on;
-    }
-
-    pub fn wal(&self) -> &Wal {
-        &self.wal
-    }
-
-    #[cfg(test)]
-    pub(crate) fn wal_mut(&mut self) -> &mut Wal {
-        &mut self.wal
     }
 
     pub fn check(&self) -> &B {
@@ -532,14 +557,6 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 }
 
-fn journal_reject(err: &WalError) -> u16 {
-    match err {
-        WalError::Full => reject::JOURNAL_FULL,
-        WalError::CancelOnly => reject::JOURNAL_CANCEL_ONLY,
-        _ => reject::JOURNAL_FAULT,
-    }
-}
-
 fn write_live(out: &mut SnapshotSink, key: u64, live: &Live) {
     out.write_u64(key);
     out.write_u64(live.handle.as_u64());
@@ -642,7 +659,7 @@ mod tests {
                 64,
             )
             .unwrap();
-            eng.wal.hold_spares(true);
+            eng.wal_mut().hold_spares(true);
             (eng, ouch)
         };
         let live = {
@@ -786,17 +803,17 @@ mod tests {
         let (mut eng, _, ouch, _) = open(&wal, 64);
         eng.set_wal(false);
         eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 1));
-        assert_eq!(eng.wal.seq(), 0);
+        assert_eq!(eng.wal_mut().seq(), 0);
         assert_eq!(ouch.pop().unwrap().ty, EventType::OrderAccepted);
 
         eng.set_wal(true);
         eng.step(&order(CommandType::Add, 1, 2, Side::Ask, 101, 1));
-        assert_eq!(eng.wal.seq(), 1);
+        assert_eq!(eng.wal_mut().seq(), 1);
         let _ = pop_all(&ouch);
 
-        let before = eng.wal.seq();
+        let before = eng.wal_mut().seq();
         eng.step(&Command::poison());
-        assert_eq!(eng.wal.seq(), before);
+        assert_eq!(eng.wal_mut().seq(), before);
         assert!(ouch.pop().is_none());
     }
 
