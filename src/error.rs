@@ -8,8 +8,10 @@ use std::path::PathBuf;
 #[derive(Debug)]
 pub enum WalError {
     Io(io::Error),
-    /// No segment is ready to take another frame.
+    /// Neither a spare nor room in the emergency reserve: nothing is journalled.
     Full,
+    /// The log is on the emergency reserve, which takes cancels only.
+    CancelOnly,
     /// A frame written with another layout version.
     Version {
         seq: u64,
@@ -56,7 +58,8 @@ impl fmt::Display for WalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WalError::Io(e) => write!(f, "wal io: {e}"),
-            WalError::Full => write!(f, "wal full: no segment ready"),
+            WalError::Full => write!(f, "wal full: no spare and no reserve room"),
+            WalError::CancelOnly => write!(f, "wal on the emergency reserve: cancels only"),
             WalError::Version { seq, found } => {
                 write!(f, "wal frame {seq} has layout version {found}")
             }

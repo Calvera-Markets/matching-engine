@@ -18,6 +18,9 @@ pub struct WalConfig {
     pub segment_bytes: usize,
     /// Prepared segments kept ready ahead of the active one.
     pub spares: usize,
+    /// Size of the emergency segment used only when no spare is ready; it
+    /// takes cancels only.
+    pub reserve_bytes: usize,
     /// Reserve blocks up front. NOTE: with this off, a full disk surfaces as
     /// SIGBUS on a write into the sparse mapping, not as an error.
     pub preallocate: bool,
@@ -39,6 +42,13 @@ impl WalConfig {
             return Err(WalError::Config(format!(
                 "segment_bytes {} is below one header and one frame ({})",
                 self.segment_bytes,
+                HEADER + FRAME
+            )));
+        }
+        if self.reserve_bytes < HEADER + FRAME {
+            return Err(WalError::Config(format!(
+                "reserve_bytes {} is below one header and one frame ({})",
+                self.reserve_bytes,
                 HEADER + FRAME
             )));
         }

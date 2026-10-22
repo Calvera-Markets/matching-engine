@@ -72,6 +72,7 @@ impl TempWal {
             epoch: 1,
             segment_bytes,
             spares: 1,
+            reserve_bytes: segment_bytes,
             preallocate: false,
             prefault: false,
             retire_queue: 4,

@@ -1,6 +1,8 @@
 //! Counters the journal publishes for monitoring. Read from any thread.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+use super::mode::Mode;
 
 #[derive(Default)]
 pub struct Counters {
@@ -11,6 +13,9 @@ pub struct Counters {
     pub(crate) rolls: AtomicU64,
     pub(crate) no_spare: AtomicU64,
     pub(crate) inline_retires: AtomicU64,
+    pub(crate) reserves_used: AtomicU64,
+    pub(crate) mode: AtomicU8,
+    pub(crate) mode_changes: AtomicU64,
 }
 
 /// Point-in-time view of the journal's counters.
@@ -32,11 +37,21 @@ pub struct WalStats {
     pub no_spare: u64,
     /// Finished segments unmapped on the writer because the retire queue was full.
     pub inline_retires: u64,
+    /// Emergency reserve segments switched to.
+    pub reserves_used: u64,
+    pub mode: Mode,
+    /// Transitions between modes.
+    pub mode_changes: u64,
 }
 
 impl Counters {
     pub(crate) fn bump(c: &AtomicU64) {
         c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_mode(&self, mode: Mode) {
+        self.mode.store(mode as u8, Ordering::Relaxed);
+        Self::bump(&self.mode_changes);
     }
 
     pub(crate) fn read(&self, spares_ready: usize) -> WalStats {
@@ -50,6 +65,9 @@ impl Counters {
             rolls: get(&self.rolls),
             no_spare: get(&self.no_spare),
             inline_retires: get(&self.inline_retires),
+            reserves_used: get(&self.reserves_used),
+            mode: Mode::from_u8(self.mode.load(Ordering::Relaxed)),
+            mode_changes: get(&self.mode_changes),
         }
     }
 }

@@ -535,6 +535,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
 fn journal_reject(err: &WalError) -> u16 {
     match err {
         WalError::Full => reject::JOURNAL_FULL,
+        WalError::CancelOnly => reject::JOURNAL_CANCEL_ONLY,
         _ => reject::JOURNAL_FAULT,
     }
 }
@@ -626,7 +627,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_log_rejects_and_live_state_matches_replay() {
+    fn normal_cancel_only_reject_all_normal_and_live_state_matches_replay() {
         let wal = TempWal::new("full");
         let open_small = |wal: &TempWal| {
             let ouch = Arc::new(Spsc::new(256));
@@ -634,7 +635,10 @@ mod tests {
                 Arc::new(Spsc::new(2)),
                 ouch.clone(),
                 Arc::new(Spsc::new(256)),
-                &wal.config(HEADER + 4 * FRAME),
+                &crate::wal::WalConfig {
+                    reserve_bytes: HEADER + 2 * FRAME,
+                    ..wal.config(HEADER + 4 * FRAME)
+                },
                 64,
             )
             .unwrap();
@@ -658,9 +662,26 @@ mod tests {
             let ev = pop_all(&ouch);
             assert_eq!(ev.len(), 1);
             assert_eq!(ev[0].ty, EventType::OrderRejected);
-            assert_eq!(ev[0].reject.reason, reject::JOURNAL_FULL);
+            assert_eq!(ev[0].reject.reason, reject::JOURNAL_CANCEL_ONLY);
             eng.step(&order(CommandType::Cancel, 1, 0, Side::Bid, 0, 0));
-            assert_eq!(pop_all(&ouch)[0].ty, EventType::OrderRejected);
+            assert_eq!(pop_all(&ouch)[0].ty, EventType::OrderCancelled);
+            eng.step(&order(CommandType::Cancel, 1, 1, Side::Bid, 0, 0));
+            eng.step(&order(CommandType::Cancel, 1, 2, Side::Bid, 0, 0));
+            let ev = pop_all(&ouch);
+            assert_eq!(ev[0].ty, EventType::OrderCancelled);
+            assert_eq!(ev[1].ty, EventType::OrderRejected);
+            assert_eq!(ev[1].reject.reason, reject::JOURNAL_FULL);
+            eng.step(&order(CommandType::Add, 1, 10, Side::Bid, 50, 1));
+            assert_eq!(pop_all(&ouch)[0].reject.reason, reject::JOURNAL_FULL);
+            eng.wal_mut().hold_spares(false);
+            let start = std::time::Instant::now();
+            while eng.wal().stats().spares_ready == 0 {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(1));
+            }
+            eng.step(&order(CommandType::Add, 1, 11, Side::Bid, 50, 1));
+            assert_eq!(pop_all(&ouch)[0].ty, EventType::OrderAccepted);
+            assert_eq!(eng.wal().mode(), crate::wal::Mode::Normal);
             eng.snapshot()
         };
         let (eng, _) = open_small(&wal);

@@ -30,6 +30,7 @@ impl RealWal {
             epoch: 1,
             segment_bytes: args.segment_bytes,
             spares: args.spares,
+            reserve_bytes: args.segment_bytes,
             preallocate: args.prep.preallocates(),
             prefault: args.prep.prefaults(),
             retire_queue: args.segments,
