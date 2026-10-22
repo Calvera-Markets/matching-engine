@@ -14,7 +14,9 @@ pub mod spsc;
 pub mod types;
 pub mod wal;
 
-pub use balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
+pub use balance::{
+    BalanceCheck, BalanceOutput, FillCtx, MatchCtx, NoCheck, OrderRef, PlaceCtx, Verdict,
+};
 #[cfg(feature = "itch")]
 pub use codec::itch;
 #[cfg(feature = "ouch")]

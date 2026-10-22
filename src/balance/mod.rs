@@ -50,8 +50,39 @@ pub struct FillCtx {
     pub quantity: u64,
 }
 
+/// A prospective fill, asked before the book applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchCtx {
+    pub taker: OrderRef,
+    pub taker_side: Side,
+    pub maker: OrderRef,
+    pub price: Price,
+    pub quantity: u64,
+}
+
+/// Check verdict for one prospective fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Fill,
+    /// Maker cannot cover: cancel the whole maker order, keep matching.
+    CancelMaker,
+    /// Taker cannot cover: stop matching and cancel the remainder.
+    StopTaker,
+}
+
 pub trait BalanceCheck {
     type Error: Copy;
+
+    /// Whether the engine asks `admit` before each fill. `false` keeps the
+    /// match loop ungated and the per-fill lookup compiles away.
+    const GATES: bool = false;
+
+    /// Per-fill verdict, called only when `GATES`. A check that admits a
+    /// fill here must also have applied both legs before returning, so the
+    /// next maker in the same sweep sees the updated balances.
+    fn admit(&mut self, _fill: &MatchCtx) -> Verdict {
+        Verdict::Fill
+    }
 
     /// Static check before matching. `Err` rejects the order untouched.
     fn on_place(&mut self, order: &PlaceCtx) -> Result<(), Self::Error>;
@@ -84,3 +115,6 @@ pub trait BalanceCheck {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod gate_tests;

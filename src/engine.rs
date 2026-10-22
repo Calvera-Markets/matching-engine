@@ -1,5 +1,7 @@
 //! Matching engine hot loop: pop Command → WAL → book → push Events.
 
+mod gate;
+
 use std::collections::HashMap;
 use std::mem;
 use std::path::Path;
@@ -8,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use calvera_books::{BookError, OrderBook, OrderHandle, Price, Side, VecConsumer};
 
+use gate::EngineGate;
+
 use crate::balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
+use crate::cancel_reason;
 use crate::entry::Entry;
 use crate::reject;
 use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
@@ -41,6 +46,8 @@ pub struct MatchingEngine<B: BalanceCheck = NoCheck> {
     wal_enabled: bool,
     slab: usize,
     check: B,
+    /// Makers the check cancelled during the current sweep.
+    uncovered: Vec<OrderHandle>,
 }
 
 impl MatchingEngine<NoCheck> {
@@ -92,6 +99,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             wal_enabled: true,
             slab,
             check,
+            uncovered: Vec::new(),
         };
         let mut recovered = Vec::new();
         engine.wal.recover(|cmd| recovered.push(cmd))?;
@@ -201,15 +209,27 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             return;
         }
 
-        match self.book.add_limit_order(cmd.side, cmd.price, cmd.quantity) {
-            Ok(resting) => {
-                let filled = self.publish_fills(cmd);
-                if let Some(handle) = resting {
-                    let remaining = cmd.quantity.saturating_sub(filled);
+        let mut gate = EngineGate {
+            check: &mut self.check,
+            by_handle: &self.by_handle,
+            by_client: &self.by_client,
+            taker: order,
+            taker_side: cmd.side,
+            uncovered: &mut self.uncovered,
+        };
+        let added = self
+            .book
+            .add_limit_order_gated(cmd.side, cmd.price, cmd.quantity, &mut gate);
+
+        match added {
+            Ok(outcome) => {
+                self.publish_fills(cmd);
+                self.cancel_uncovered_makers();
+                if let Some(handle) = outcome.handle {
                     let live = Live {
                         handle,
                         price: cmd.price,
-                        qty: remaining,
+                        qty: outcome.remaining,
                         side: cmd.side,
                         cl_ord_id: cmd.cl_ord_id,
                         client_fd: cmd.client_fd,
@@ -217,14 +237,19 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                     };
                     self.by_handle.insert(handle, key);
                     self.by_client.insert(key, live);
-                    self.accept(cmd, handle, remaining, b'L');
+                    self.accept(cmd, handle, outcome.remaining, b'L');
                 } else {
                     self.check.on_done(order);
+                    if outcome.stopped {
+                        self.emit_balance_outputs();
+                        self.emit_taker_uncovered(cmd, outcome.remaining);
+                    }
                 }
             }
             Err(err) => {
                 // Matching ran before the rest failed: report those fills too.
                 self.publish_fills(cmd);
+                self.cancel_uncovered_makers();
                 self.check.on_done(order);
                 let reason = match err {
                     BookError::SlabFull => reject::SLAB_FULL,
@@ -233,6 +258,29 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 self.reject(cmd, reason);
             }
         }
+    }
+
+    /// Makers the check vetoed are already off the book; drop them here.
+    fn cancel_uncovered_makers(&mut self) {
+        if self.uncovered.is_empty() {
+            return;
+        }
+        let mut uncovered = mem::take(&mut self.uncovered);
+        for handle in uncovered.drain(..) {
+            let Some(key) = self.by_handle.remove(&handle) else {
+                continue;
+            };
+            let Some(live) = self.by_client.remove(&key) else {
+                continue;
+            };
+            self.check.on_done(OrderRef {
+                client_fd: live.client_fd,
+                user_ref: live.user_ref,
+            });
+            self.emit_balance_outputs();
+            self.emit_cancelled_with(&live, cancel_reason::MAKER_UNCOVERED);
+        }
+        self.uncovered = uncovered;
     }
 
     fn cancel(&mut self, cmd: &Command) {
@@ -374,7 +422,11 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 
     fn emit_cancelled(&mut self, live: &Live) {
-        self.emit(Event::cancelled(
+        self.emit_cancelled_with(live, cancel_reason::NONE);
+    }
+
+    fn emit_cancelled_with(&mut self, live: &Live, reason: u16) {
+        self.emit(Event::cancelled_with_reason(
             live.client_fd,
             EventOrder {
                 order_id: live.handle.as_u64(),
@@ -386,6 +438,25 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 cl_ord_id: live.cl_ord_id,
                 cancel_reason: 0,
             },
+            reason,
+        ));
+    }
+
+    /// The taker never rested; `order_id` 0 marks it as such.
+    fn emit_taker_uncovered(&mut self, cmd: &Command, remaining: u64) {
+        self.emit(Event::cancelled_with_reason(
+            cmd.client_fd,
+            EventOrder {
+                order_id: 0,
+                user_ref: cmd.user_ref,
+                price: cmd.price,
+                quantity: remaining,
+                side: cmd.side,
+                order_state: b'D',
+                cl_ord_id: cmd.cl_ord_id,
+                cancel_reason: 0,
+            },
+            cancel_reason::TAKER_UNCOVERED,
         ));
     }
 
