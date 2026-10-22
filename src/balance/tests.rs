@@ -9,6 +9,7 @@ use crate::entry::Entry;
 use crate::reject;
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventType};
+use crate::wal::{FRAME, HEADER};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
@@ -102,9 +103,8 @@ fn open_sized(wal: &TempWal, slab: usize, max_qty: u64, wal_bytes: usize) -> Rig
         Arc::new(Spsc::new(8)),
         ouch.clone(),
         Arc::new(Spsc::new(256)),
-        &wal.0,
+        &wal.config(wal_bytes),
         slab,
-        wal_bytes,
         Recorder {
             max_qty,
             calls: Vec::new(),
@@ -302,7 +302,8 @@ fn ack_sequence_continues_after_a_restart() {
 #[test]
 fn an_entry_the_log_refuses_is_reported_and_not_applied() {
     let wal = TempWal::new("ack-full");
-    let (mut eng, ouch) = open_sized(&wal, 64, 100, 128);
+    let (mut eng, ouch) = open_sized(&wal, 64, 100, HEADER + FRAME);
+    eng.wal_mut().hold_spares(true);
     eng.step(&entry(1).to_command());
     eng.step(&entry(2).to_command());
     eng.step(&entry(3).to_command());

@@ -84,9 +84,8 @@ fn open(wal: &TempWal) -> (MatchingEngine<Budget>, Arc<Spsc<Event>>) {
         Arc::new(Spsc::new(8)),
         ouch.clone(),
         Arc::new(Spsc::new(256)),
-        &wal.0,
+        &wal.config(64 * 1024),
         64,
-        64 * 1024,
         Budget::default(),
     )
     .unwrap();

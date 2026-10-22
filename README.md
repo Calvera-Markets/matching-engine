@@ -17,7 +17,7 @@ Order-entry and market-data are chosen at compile time (`Ingress<Oe>`, `Egress<O
 - Private egress: ack to whoever sent the order.
 - Public tape: a separate queue, so a slow multicast reader cannot stall.
 
-The book gives each resting order a handle, and cancels, fills, and acks refer to that order by the handle. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. The WAL write is a store into the mmap, with no fsync, so the engine thread does not wait on disk. A power loss can drop the tail the kernel has not flushed.
+The book gives each resting order a handle, and cancels, fills, and acks refer to that order by the handle. The engine maps `(client_fd, user_ref)` and turns fills into trades using the maker’s resting price. The WAL is a chain of fixed-size mmap segment files. A write is a store into the mapping, with no fsync, so the engine thread does not wait on disk; a power loss can drop the tail the kernel has not flushed. A command the WAL cannot take is rejected, never applied. Recovery checks that sequences and the checksum chain run unbroken across segments.
 
 ## Features
 
@@ -32,7 +32,7 @@ SBE identity on the wire is numeric `userRef` (OUCH-class). FIX identity is ClOr
 
 ## Running
 
-`just` lists the commands. `just run` is OUCH in and ITCH out, `just fix` is FIX in and ITCH out, and `just sbe` is SBE in and out. `just test`, `just test-fix`, and `just test-sbe` are the three test sets.
+`just` lists the commands. The binaries need the `--wal-*` flags (directory, epoch, segment size, spares, preallocate, prefault); `--help` lists them. `just run` is OUCH in and ITCH out, `just fix` is FIX in and ITCH out, and `just sbe` is SBE in and out. `just test`, `just test-fix`, and `just test-sbe` are the three test sets.
 
 Cores default to 8 / 10 / 12 / 14 (`--cpu-ingress` and friends). Pinning is Linux-only.
 
