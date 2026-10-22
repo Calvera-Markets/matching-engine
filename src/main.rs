@@ -260,6 +260,14 @@ mod tests {
             "off",
             "--wal-prefault",
             "off",
+            "--wal-retire-queue",
+            "4",
+            "--wal-seal-sync",
+            "off",
+            "--wal-preparer-poll-us",
+            "100",
+            "--wal-preparer-cpu",
+            "none",
         ])
     }
 

@@ -4,6 +4,7 @@
 #
 #   scripts/wal_fs_bench.sh --work DIR --image-gb N --out CSV --repeats N \
 #     --segment-bytes N --segments N --spares N --rate N --window N \
+#     --writers "synthetic wal" --poll-us N \
 #     [--mounts "xfs=/mnt/a ext4=/mnt/b"] [--cpus "writer helper journal"]
 #
 # Without --mounts it needs sudo for losetup/mount. Nothing leaves the host.
@@ -11,7 +12,7 @@ set -euo pipefail
 
 die() { echo "wal_fs_bench: $*" >&2; exit 2; }
 
-work= image_gb= out= repeats= segment_bytes= segments= spares= rate= window= mounts= cpus=
+work= image_gb= out= repeats= segment_bytes= segments= spares= rate= window= mounts= cpus= writers= poll_us=
 while [[ $# -gt 0 ]]; do
   [[ $# -ge 2 ]] || die "$1 needs a value"
   case "$1" in
@@ -26,11 +27,13 @@ while [[ $# -gt 0 ]]; do
     --window) window=$2 ;;
     --mounts) mounts=$2 ;;
     --cpus) cpus=$2 ;;
+    --writers) writers=$2 ;;
+    --poll-us) poll_us=$2 ;;
     *) die "unknown flag $1" ;;
   esac
   shift 2
 done
-for v in work out repeats segment_bytes segments spares rate window; do
+for v in work out repeats segment_bytes segments spares rate window writers poll_us; do
   [[ -n "${!v}" ]] || die "missing --${v//_/-}"
 done
 
@@ -76,11 +79,15 @@ fi
 
 for r in $(seq 1 "$repeats"); do
   for fs in "${!dirs[@]}"; do
-    for prep in hot sparse prealloc prefault both; do
-      for mode in inline threaded; do
-        "$bin" --dir "${dirs[$fs]}" --segment-bytes "$segment_bytes" --segments "$segments" \
-          --spares "$spares" --rate "$rate" --window "$window" --prep "$prep" --mode "$mode" \
-          --label "run$r" --out "$out" "${cpu_flags[@]}" | tail -n 1
+    for writer in $writers; do
+      for prep in hot sparse prealloc prefault both; do
+        [[ $writer == wal && $prep == hot ]] && continue
+        for mode in inline threaded; do
+          "$bin" --dir "${dirs[$fs]}" --segment-bytes "$segment_bytes" --segments "$segments" \
+            --spares "$spares" --rate "$rate" --window "$window" --prep "$prep" --mode "$mode" \
+            --writer "$writer" --poll-us "$poll_us" --label "run$r" --out "$out" \
+            "${cpu_flags[@]}" | tail -n 1
+        done
       done
     done
   done

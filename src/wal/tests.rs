@@ -39,10 +39,21 @@ fn open(cfg: &WalConfig) -> Result<(Wal, Vec<Command>), WalError> {
     Ok((w, got))
 }
 
+/// Write, waiting out `Full` while the preparer catches up.
+fn write(w: &mut Wal, cmd: &Command) {
+    loop {
+        match w.write(cmd) {
+            Ok(()) => return,
+            Err(WalError::Full) => std::thread::yield_now(),
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
 fn write_n(cfg: &WalConfig, n: u32) {
     let (mut w, _) = open(cfg).unwrap();
     for user in 0..n {
-        w.write(&add(user)).unwrap();
+        write(&mut w, &add(user));
     }
 }
 
@@ -99,7 +110,7 @@ fn round_trips_every_command_field() {
         let (mut w, got) = open(&cfg).unwrap();
         assert!(got.is_empty());
         for cmd in &written {
-            w.write(cmd).unwrap();
+            write(&mut w, cmd);
         }
         assert_eq!(w.seq(), 6);
     }
@@ -138,9 +149,9 @@ fn rolls_across_many_segments_and_resumes_where_it_stopped() {
     assert_eq!(got.len(), PER * 5 + 2);
     assert!(got.iter().enumerate().all(|(i, c)| c.user_ref == i as u32));
     assert_eq!(w.segment(), 5);
-    w.write(&add(99)).unwrap();
-    w.write(&add(100)).unwrap();
-    w.write(&add(101)).unwrap();
+    write(&mut w, &add(99));
+    write(&mut w, &add(100));
+    write(&mut w, &add(101));
     assert_eq!(w.segment(), 6);
     drop(w);
     let (w, got) = open(&cfg).unwrap();
@@ -158,7 +169,7 @@ fn blank_spares_are_removed_on_open() {
     assert_eq!(files(), 2);
     let (w, _) = open(&cfg).unwrap();
     assert_eq!(files(), 2);
-    assert_eq!(w.spares_ready(), 1);
+    assert_eq!(w.stats().spares_ready, 1);
 }
 
 #[test]
@@ -170,7 +181,7 @@ fn a_torn_last_frame_is_dropped() {
     poke(&segs[1].0, HEADER + FRAME + 20, |b| b[0] ^= 0xFF);
     let (mut w, got) = open(&cfg).unwrap();
     assert_eq!(got.len(), PER + 1);
-    w.write(&add(77)).unwrap();
+    write(&mut w, &add(77));
     drop(w);
     let (_, got) = open(&cfg).unwrap();
     assert_eq!(got.len(), PER + 2);
@@ -320,7 +331,7 @@ fn full_when_no_spare_is_ready_and_nothing_is_written() {
     assert!(matches!(w.write(&add(50)), Err(WalError::Full)));
     assert_eq!(w.seq(), (PER * 2) as u64);
     w.hold_spares(false);
-    w.write(&add(51)).unwrap();
+    write(&mut w, &add(51));
     drop(w);
     let (_, got) = open(&cfg).unwrap();
     assert_eq!(got.len(), PER * 2 + 1);
@@ -370,8 +381,88 @@ fn flags_build_a_config_and_report_what_is_missing() {
     partial.set("--wal-dir", "/tmp").unwrap();
     assert!(matches!(partial.build(), Err(WalError::Config(m)) if m.contains("--wal-epoch")));
     flags.set("--wal-prefault", "off").unwrap();
+    assert!(
+        matches!(flags.clone().build(), Err(WalError::Config(m)) if m.contains("--wal-retire-queue"))
+    );
+    flags.set("--wal-retire-queue", "8").unwrap();
+    flags.set("--wal-seal-sync", "on").unwrap();
+    flags.set("--wal-preparer-poll-us", "50").unwrap();
+    flags.set("--wal-preparer-cpu", "none").unwrap();
     let cfg = flags.build().unwrap();
+    assert_eq!(cfg.preparer_cpu, None);
+    assert!(cfg.seal_sync);
     assert_eq!(cfg.segment_bytes, 1 << 20);
     assert_eq!(cfg.epoch, 3);
     assert!(cfg.preallocate && !cfg.prefault);
+}
+
+#[test]
+fn the_preparer_keeps_spares_ready_and_seals_full_segments() {
+    let wal = TempWal::new("seg-prep-thread");
+    let mut cfg = small(&wal);
+    cfg.spares = 3;
+    cfg.seal_sync = true;
+    cfg.retire_queue = 32;
+    let (mut w, _) = open(&cfg).unwrap();
+    assert_eq!(w.stats().spares_ready, 3);
+    for user in 0..(PER * 20) as u32 {
+        write(&mut w, &add(user));
+    }
+    let settled = wait_for(|| {
+        let s = w.stats();
+        s.spares_ready == 3 && s.sealed == 19
+    });
+    assert!(settled, "{:?}", w.stats());
+    let s = w.stats();
+    assert_eq!(s.prepare_failures, 0);
+    assert_eq!(s.seal_failures, 0);
+    assert_eq!(s.inline_retires, 0);
+    assert_eq!(s.rolls, 19);
+    drop(w);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 20);
+}
+
+#[test]
+fn a_held_preparer_runs_the_log_out_of_spares_and_recovers() {
+    let wal = TempWal::new("seg-prep-held");
+    let mut cfg = small(&wal);
+    cfg.spares = 2;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 3) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    assert!(matches!(w.write(&add(99)), Err(WalError::Full)));
+    let s = w.stats();
+    assert_eq!(s.spares_ready, 0);
+    assert_eq!(s.no_spare, 1);
+    w.hold_spares(false);
+    assert!(wait_for(|| w.stats().spares_ready == 2));
+    write(&mut w, &add(100));
+    assert_eq!(w.seq(), (PER * 3 + 1) as u64);
+}
+
+#[test]
+fn a_monitor_reads_counters_from_another_thread() {
+    let wal = TempWal::new("seg-monitor");
+    let cfg = small(&wal);
+    let (mut w, _) = open(&cfg).unwrap();
+    let monitor = w.monitor();
+    for user in 0..(PER + 1) as u32 {
+        write(&mut w, &add(user));
+    }
+    let seen = std::thread::spawn(move || wait_for(|| monitor.stats().sealed == 1));
+    assert!(seen.join().unwrap());
+}
+
+fn wait_for(mut ok: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
 }

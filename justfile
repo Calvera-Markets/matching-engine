@@ -86,5 +86,5 @@ wal-bench *FLAGS:
 
 # Tiny wal_switch run in DIR, checks the harness end to end
 wal-bench-smoke DIR:
-    cargo bench --bench wal_switch -- --dir {{DIR}} --segment-bytes 1048576 --segments 4 --spares 2 --rate 0 --window 64 --prep both --mode threaded --label smoke --out {{DIR}}/wal_switch.csv
+    cargo bench --bench wal_switch -- --dir {{DIR}} --segment-bytes 1048576 --segments 4 --spares 2 --rate 0 --window 64 --prep both --mode threaded --writer wal --poll-us 100 --label smoke --out {{DIR}}/wal_switch.csv
     test -s {{DIR}}/wal_switch.csv

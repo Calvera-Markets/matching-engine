@@ -142,6 +142,15 @@ impl Segment {
     pub fn clear(&mut self, offset: usize, len: usize) {
         unsafe { ptr::write_bytes(self.ptr.add(offset), 0, len) };
     }
+
+    /// Flush the mapping to the file.
+    pub fn sync(&self) -> io::Result<()> {
+        let rc = unsafe { libc::msync(self.ptr as *mut libc::c_void, self.len, libc::MS_SYNC) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Segment {

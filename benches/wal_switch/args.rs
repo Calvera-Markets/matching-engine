@@ -25,6 +25,14 @@ pub enum Mode {
     Threaded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Impl {
+    /// Minimal frame writer in this harness.
+    Synthetic,
+    /// The engine's `Wal`, with its preparer thread.
+    Wal { poll_us: u64 },
+}
+
 #[derive(Debug, Clone)]
 pub struct Args {
     pub dir: PathBuf,
@@ -35,6 +43,7 @@ pub struct Args {
     pub window: usize,
     pub prep: Prep,
     pub mode: Mode,
+    pub writer: Impl,
     pub label: String,
     pub out: PathBuf,
     pub cpu_writer: Option<usize>,
@@ -73,7 +82,7 @@ impl Mode {
 
 const USAGE: &str = "wal_switch --dir DIR --segment-bytes N --segments N --spares N \
 --rate MSGS_PER_S(0=unpaced) --window FRAMES --prep hot|sparse|prealloc|prefault|both \
---mode inline|threaded --label TEXT --out CSV [--cpu-writer N] [--cpu-helper N] [--cpu-journal N]";
+--mode inline|threaded --writer synthetic|wal [--poll-us N, with wal] --label TEXT --out CSV [--cpu-writer N] [--cpu-helper N] [--cpu-journal N]";
 
 pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut dir = None;
@@ -84,6 +93,8 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut window = None;
     let mut prep = None;
     let mut mode = None;
+    let mut writer = None;
+    let mut poll_us = None;
     let mut label = None;
     let mut out = None;
     let mut cpu_writer = None;
@@ -105,6 +116,8 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
             "--window" => window = Some(number(&flag, &value)?),
             "--prep" => prep = Some(parse_prep(&value)?),
             "--mode" => mode = Some(parse_mode(&value)?),
+            "--writer" => writer = Some(value),
+            "--poll-us" => poll_us = Some(number(&flag, &value)? as u64),
             "--label" => label = Some(value),
             "--out" => out = Some(PathBuf::from(value)),
             "--cpu-writer" => cpu_writer = Some(number(&flag, &value)?),
@@ -122,6 +135,13 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<Args, String> {
         window: required("--window", window)?,
         prep: required("--prep", prep)?,
         mode: required("--mode", mode)?,
+        writer: match required("--writer", writer)?.as_str() {
+            "synthetic" => Impl::Synthetic,
+            "wal" => Impl::Wal {
+                poll_us: required("--poll-us", poll_us)?,
+            },
+            other => return Err(format!("--writer {other}: expected synthetic|wal")),
+        },
         label: required("--label", label)?,
         out: required("--out", out)?,
         cpu_writer,
