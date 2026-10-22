@@ -79,3 +79,12 @@ tape-fix *FLAGS:
 # Hot-path bench
 bench *FLAGS:
     cargo bench --bench hot -- {{FLAGS}}
+
+# Journal file-switch bench, one run. Flags: see `scripts/wal_fs_bench.sh`.
+wal-bench *FLAGS:
+    cargo bench --bench wal_switch -- {{FLAGS}}
+
+# Tiny wal_switch run in DIR, checks the harness end to end
+wal-bench-smoke DIR:
+    cargo bench --bench wal_switch -- --dir {{DIR}} --segment-bytes 1048576 --segments 4 --spares 2 --rate 0 --window 64 --prep both --mode threaded --label smoke --out {{DIR}}/wal_switch.csv
+    test -s {{DIR}}/wal_switch.csv
