@@ -5,6 +5,7 @@ use std::io;
 use std::path::Path;
 use std::ptr;
 
+use crate::error::WalError;
 use crate::types::{Command, CommandType};
 use calvera_books::{Price, Side};
 
@@ -84,9 +85,11 @@ impl Wal {
         self.offset
     }
 
-    pub fn write(&mut self, cmd: &Command) {
+    /// Append one frame. `Full` leaves the log unchanged; the caller must
+    /// not apply the command.
+    pub fn write(&mut self, cmd: &Command) -> Result<(), WalError> {
         if self.offset + FRAME > self.len {
-            return;
+            return Err(WalError::Full);
         }
         self.seq += 1;
         let frame = pack(cmd, self.seq);
@@ -94,30 +97,47 @@ impl Wal {
             ptr::write_unaligned(self.ptr.add(self.offset) as *mut WalFrame, frame);
         }
         self.offset += FRAME;
+        Ok(())
     }
 
-    /// Replay every valid frame in order. A frame written with another
-    /// layout version is an error: it is refused, never misread.
-    pub fn recover(&mut self, mut visit: impl FnMut(Command)) -> io::Result<()> {
+    /// Replay every frame in order. Sequences must run 1, 2, 3, ... with no
+    /// gap. The log ends at the first all-zero frame. An invalid frame is
+    /// dropped only when nothing but zeros follows it (a torn last write);
+    /// anywhere else it is an error. A frame with another layout version is
+    /// refused, never misread.
+    pub fn recover(&mut self, mut visit: impl FnMut(Command)) -> Result<(), WalError> {
         let mut offset = 0;
         let mut seq = 0u64;
         while offset + FRAME <= self.len {
-            let frame = unsafe { ptr::read_unaligned(self.ptr.add(offset) as *const WalFrame) };
-            if frame.magic != WAL_MAGIC {
+            let bytes = unsafe { std::slice::from_raw_parts(self.ptr.add(offset), FRAME) };
+            if is_zero(bytes) {
                 break;
             }
-            let got = checksum(&frame);
-            if got != frame.checksum {
-                break;
+            let frame = unsafe { ptr::read_unaligned(self.ptr.add(offset) as *const WalFrame) };
+            if frame.magic != WAL_MAGIC || checksum(&frame) != frame.checksum {
+                let rest = unsafe {
+                    std::slice::from_raw_parts(
+                        self.ptr.add(offset + FRAME),
+                        self.len - offset - FRAME,
+                    )
+                };
+                if is_zero(rest) {
+                    unsafe { ptr::write_bytes(self.ptr.add(offset), 0, FRAME) };
+                    break;
+                }
+                return Err(WalError::Corrupt { offset });
             }
             if frame.version != WAL_VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "WAL frame {} has version {}, expected {WAL_VERSION}",
-                        frame.seq, frame.version
-                    ),
-                ));
+                return Err(WalError::Version {
+                    seq: frame.seq,
+                    found: frame.version,
+                });
+            }
+            if frame.seq != seq + 1 {
+                return Err(WalError::Gap {
+                    expected: seq + 1,
+                    found: frame.seq,
+                });
             }
             visit(unpack(&frame));
             seq = frame.seq;
@@ -127,6 +147,10 @@ impl Wal {
         self.offset = offset;
         Ok(())
     }
+}
+
+fn is_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&b| b == 0)
 }
 
 impl Drop for Wal {
@@ -224,8 +248,16 @@ mod tests {
         cmd
     }
 
+    fn frame_at(w: &Wal, i: usize) -> WalFrame {
+        unsafe { ptr::read_unaligned(w.ptr.add(i * FRAME) as *const WalFrame) }
+    }
+
+    fn put_frame(w: &mut Wal, i: usize, frame: WalFrame) {
+        unsafe { ptr::write_unaligned(w.ptr.add(i * FRAME) as *mut WalFrame, frame) };
+    }
+
     #[test]
-    fn round_trips_every_command_and_stops_on_a_bad_checksum() {
+    fn round_trips_every_command_and_drops_a_torn_tail() {
         let wal = TempWal::new("roundtrip");
         let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
         let mut none = 0;
@@ -241,7 +273,7 @@ mod tests {
             sample(CommandType::Entry, Side::Bid, 5),
         ];
         for cmd in &written {
-            w.write(cmd);
+            w.write(cmd).unwrap();
         }
         assert_eq!(w.bytes_written(), written.len() * FRAME);
 
@@ -252,12 +284,12 @@ mod tests {
         assert_eq!(got[5].ty, CommandType::Entry);
         assert_eq!(got[1].side, Side::Ask);
         unsafe {
-            *w.ptr.add(4 * FRAME + 16) = 0xAB;
+            *w.ptr.add(5 * FRAME + 16) = 0xAB;
         }
         got.clear();
         w.recover(|cmd| got.push(cmd)).unwrap();
-        assert_eq!(got.len(), 4);
-        assert_eq!(w.bytes_written(), 4 * FRAME);
+        assert_eq!(got.len(), 5);
+        assert_eq!(w.bytes_written(), 5 * FRAME);
         for (got, want) in got.iter().zip(written.iter()) {
             assert_eq!(got.ty, want.ty);
             assert_eq!(got.side, want.side);
@@ -270,38 +302,81 @@ mod tests {
             assert_eq!(got.cl_ord_id, want.cl_ord_id);
             assert_eq!(got.capacity, 0);
         }
+
+        w.write(&written[0]).unwrap();
+        let mut seqs = Vec::new();
+        w.recover(|_| seqs.push(())).unwrap();
+        assert_eq!(seqs.len(), 6);
+        assert_eq!(frame_at(&w, 5).seq, 6);
+    }
+
+    #[test]
+    fn a_bad_frame_before_the_tail_is_an_error() {
+        let wal = TempWal::new("mid");
+        let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
+        for user in 0..4 {
+            w.write(&sample(CommandType::Add, Side::Bid, user)).unwrap();
+        }
+        unsafe {
+            *w.ptr.add(FRAME + 16) = 0xAB;
+        }
+        let mut got = 0;
+        let err = w.recover(|_| got += 1).unwrap_err();
+        assert!(matches!(err, WalError::Corrupt { offset } if offset == FRAME));
+        assert_eq!(got, 1);
+    }
+
+    #[test]
+    fn a_sequence_gap_is_an_error() {
+        let wal = TempWal::new("gap");
+        let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
+        for user in 0..3 {
+            w.write(&sample(CommandType::Add, Side::Bid, user)).unwrap();
+        }
+        let mut frame = frame_at(&w, 1);
+        frame.seq = 7;
+        frame.checksum = checksum(&frame);
+        put_frame(&mut w, 1, frame);
+        let err = w.recover(|_| {}).unwrap_err();
+        assert!(matches!(
+            err,
+            WalError::Gap {
+                expected: 2,
+                found: 7
+            }
+        ));
     }
 
     #[test]
     fn a_frame_from_another_layout_version_is_refused() {
         let wal = TempWal::new("version");
         let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
-        w.write(&sample(CommandType::Add, Side::Bid, 1));
-        w.write(&sample(CommandType::Add, Side::Ask, 2));
-        unsafe {
-            let at = w.ptr.add(FRAME) as *mut WalFrame;
-            let mut frame = ptr::read_unaligned(at);
-            frame.version = WAL_VERSION.wrapping_add(1);
-            frame.checksum = checksum(&frame);
-            ptr::write_unaligned(at, frame);
-        }
+        w.write(&sample(CommandType::Add, Side::Bid, 1)).unwrap();
+        w.write(&sample(CommandType::Add, Side::Ask, 2)).unwrap();
+        let mut frame = frame_at(&w, 1);
+        frame.version = WAL_VERSION.wrapping_add(1);
+        frame.checksum = checksum(&frame);
+        put_frame(&mut w, 1, frame);
         let mut got = 0;
         let err = w.recover(|_| got += 1).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(matches!(err, WalError::Version { seq: 2, .. }));
         assert_eq!(got, 1);
     }
 
     #[test]
-    fn write_stops_when_the_file_is_full() {
+    fn a_write_to_a_full_log_errors_and_writes_nothing() {
         let wal = TempWal::new("full");
         let mut w = Wal::open_sized(&wal.0, 4096).unwrap();
         let cmd = sample(CommandType::Add, Side::Bid, 1);
         for _ in 0..(4096 / FRAME) {
-            w.write(&cmd);
+            w.write(&cmd).unwrap();
         }
         assert_eq!(w.bytes_written(), 4096);
-        w.write(&cmd);
+        assert!(matches!(w.write(&cmd), Err(WalError::Full)));
         assert_eq!(w.bytes_written(), 4096);
+        let mut n = 0;
+        w.recover(|_| n += 1).unwrap();
+        assert_eq!(n, 4096 / FRAME);
     }
 
     #[test]

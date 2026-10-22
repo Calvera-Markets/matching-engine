@@ -96,6 +96,11 @@ pub trait BalanceCheck {
     /// A journalled entry addressed to the check.
     fn apply_entry(&mut self, entry: &Entry);
 
+    /// The journal refused `entry`, so it was not applied. `reason` is a
+    /// `reject` code. A check that acks entries reports the refusal here so
+    /// the sender can retry. Default: nothing.
+    fn refuse_entry(&mut self, _entry: &Entry, _reason: u16) {}
+
     /// The book was reset; every open order is gone.
     fn on_reset(&mut self);
 
