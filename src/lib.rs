@@ -8,6 +8,7 @@ pub mod entry;
 pub mod ingress;
 pub mod md_pub;
 pub mod reject;
+pub mod snapshot;
 pub mod spsc;
 pub mod types;
 pub mod wal;
@@ -19,6 +20,7 @@ pub use codec::itch;
 pub use codec::ouch;
 pub use engine::MatchingEngine;
 pub use entry::Entry;
+pub use snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 pub use spsc::Spsc;
 pub use types::{Command, CommandType, Event, EventType};
 

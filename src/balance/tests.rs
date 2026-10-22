@@ -56,6 +56,10 @@ impl BalanceCheck for Recorder {
     fn reject_code(err: u8) -> u8 {
         err
     }
+
+    fn write_snapshot(&self, out: &mut crate::snapshot::SnapshotSink) {
+        out.write_u64(self.max_qty);
+    }
 }
 
 type Rig = (MatchingEngine<Recorder>, Arc<Spsc<Event>>);

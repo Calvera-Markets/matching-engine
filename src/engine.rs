@@ -11,6 +11,7 @@ use calvera_books::{BookError, OrderBook, OrderHandle, Price, Side, VecConsumer}
 use crate::balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
 use crate::entry::Entry;
 use crate::reject;
+use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventOrder, EventReject, EventTrade};
 use crate::wal::Wal;
@@ -133,6 +134,22 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     /// State changes that must survive replay belong in journalled entries.
     pub fn check_mut(&mut self) -> &mut B {
         &mut self.check
+    }
+
+    /// Checkpoint of open orders, match counter, and the balance check.
+    /// Layout: version, match counter, open orders sorted by key, check.
+    pub fn snapshot(&self) -> Snapshot {
+        let mut out = SnapshotSink::new();
+        out.write_u64(SNAPSHOT_VERSION);
+        out.write_u64(self.next_match);
+        let mut keys: Vec<u64> = self.by_client.keys().copied().collect();
+        keys.sort_unstable();
+        out.write_u64(keys.len() as u64);
+        for key in keys {
+            write_live(&mut out, key, &self.by_client[&key]);
+        }
+        self.check.write_snapshot(&mut out);
+        out.finish()
     }
 
     pub fn drain_events(&mut self) -> usize {
@@ -390,6 +407,17 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 }
 
+fn write_live(out: &mut SnapshotSink, key: u64, live: &Live) {
+    out.write_u64(key);
+    out.write_u64(live.handle.as_u64());
+    out.write_u64(live.price.0);
+    out.write_u64(live.qty);
+    out.write_u8(live.side as u8);
+    out.write_bytes(&live.cl_ord_id);
+    out.write_i32(live.client_fd);
+    out.write_u32(live.user_ref);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +470,28 @@ mod tests {
         )
         .unwrap();
         (eng, cmds, ouch, itch)
+    }
+
+    #[test]
+    fn same_log_same_snapshot() {
+        let wal = TempWal::new("snap");
+        let run = |wal: &TempWal| {
+            let (mut eng, _, _, _) = open(wal, 64);
+            eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+            eng.step(&order(CommandType::Add, 2, 1, Side::Ask, 100, 4));
+            eng.step(&order(CommandType::Add, 1, 2, Side::Bid, 99, 3));
+            eng.snapshot()
+        };
+        let s1 = run(&wal);
+        // Reopen on the same WAL: recovery rebuilds identical state.
+        let (mut eng2, _, _, _) = open(&wal, 64);
+        assert_eq!(eng2.snapshot(), s1);
+        // An independent run of the same tape on a fresh WAL must match.
+        let wal_b = TempWal::new("snap-b");
+        assert_eq!(run(&wal_b), s1);
+        // A different tape gives a different snapshot.
+        eng2.step(&order(CommandType::Cancel, 1, 2, Side::Bid, 0, 0));
+        assert_ne!(eng2.snapshot(), s1);
     }
 
     #[test]

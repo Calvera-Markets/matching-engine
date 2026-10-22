@@ -2,6 +2,7 @@ use std::convert::Infallible;
 
 use super::{BalanceCheck, FillCtx, OrderRef, PlaceCtx};
 use crate::entry::Entry;
+use crate::snapshot::SnapshotSink;
 
 /// No balance check. Every hook is an empty inline body, so an engine built
 /// with it compiles to the same code as an engine without hooks.
@@ -34,4 +35,7 @@ impl BalanceCheck for NoCheck {
     fn reject_code(err: Self::Error) -> u8 {
         match err {}
     }
+
+    #[inline(always)]
+    fn write_snapshot(&self, _out: &mut SnapshotSink) {}
 }
