@@ -58,7 +58,7 @@ impl Command {
 }
 
 pub fn composite_key(fd: i32, user_ref: u32) -> u64 {
-    ((fd as u32 as u64) << 32) | user_ref as u64
+    ((fd as u32 as u64) << 32) | u64::from(user_ref)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,10 @@ pub enum EventType {
     OrderRejected,
     TradeExecuted,
     BookReset,
+    /// Terminal result of one journalled balance entry.
+    BalanceAck,
+    /// Slice after an applied fund/defund/lock/unlock/settle leg.
+    BalanceChanged,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +85,8 @@ pub struct EventOrder {
     pub side: Side,
     pub order_state: u8,
     pub cl_ord_id: [u8; 14],
+    /// Meaningful on `OrderCancelled`. See `cancel_reason`.
+    pub cancel_reason: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,6 +106,27 @@ pub struct EventReject {
     pub cl_ord_id: [u8; 14],
 }
 
+/// Terminal ack for one `CommandType::Entry`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventBalanceAck {
+    pub channel: u32,
+    pub seq: u64,
+    pub engine_seq: u64,
+    /// 0 = Applied, 1 = Refused, 2 = Duplicate.
+    pub kind: u8,
+    pub reason: u16,
+}
+
+/// One slice after an applied balance change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventBalanceChanged {
+    pub account: u64,
+    pub asset: u8,
+    pub balance: u64,
+    pub locked: u64,
+    pub engine_seq: u64,
+}
+
 /// 64-byte slot so producer/consumer do not false-share a ring entry.
 #[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
@@ -110,6 +137,8 @@ pub struct Event {
     pub order: EventOrder,
     pub trade: EventTrade,
     pub reject: EventReject,
+    pub balance_ack: EventBalanceAck,
+    pub balance_changed: EventBalanceChanged,
 }
 
 impl Event {
@@ -121,6 +150,8 @@ impl Event {
             order,
             trade: empty_trade(),
             reject: empty_reject(),
+            balance_ack: empty_ack(),
+            balance_changed: empty_changed(),
         }
     }
 
@@ -132,7 +163,14 @@ impl Event {
             order,
             trade: empty_trade(),
             reject: empty_reject(),
+            balance_ack: empty_ack(),
+            balance_changed: empty_changed(),
         }
+    }
+
+    pub fn cancelled_with_reason(fd: i32, mut order: EventOrder, reason: u16) -> Self {
+        order.cancel_reason = reason;
+        Self::cancelled(fd, order)
     }
 
     pub fn modified(fd: i32, order: EventOrder) -> Self {
@@ -143,6 +181,8 @@ impl Event {
             order,
             trade: empty_trade(),
             reject: empty_reject(),
+            balance_ack: empty_ack(),
+            balance_changed: empty_changed(),
         }
     }
 
@@ -154,6 +194,8 @@ impl Event {
             order: empty_order(),
             trade: empty_trade(),
             reject,
+            balance_ack: empty_ack(),
+            balance_changed: empty_changed(),
         }
     }
 
@@ -165,6 +207,34 @@ impl Event {
             order: empty_order(),
             trade,
             reject: empty_reject(),
+            balance_ack: empty_ack(),
+            balance_changed: empty_changed(),
+        }
+    }
+
+    pub fn balance_ack(ack: EventBalanceAck) -> Self {
+        Self {
+            ty: EventType::BalanceAck,
+            client_fd: -1,
+            timestamp: 0,
+            order: empty_order(),
+            trade: empty_trade(),
+            reject: empty_reject(),
+            balance_ack: ack,
+            balance_changed: empty_changed(),
+        }
+    }
+
+    pub fn balance_changed(change: EventBalanceChanged) -> Self {
+        Self {
+            ty: EventType::BalanceChanged,
+            client_fd: -1,
+            timestamp: 0,
+            order: empty_order(),
+            trade: empty_trade(),
+            reject: empty_reject(),
+            balance_ack: empty_ack(),
+            balance_changed: change,
         }
     }
 
@@ -176,6 +246,8 @@ impl Event {
             order: empty_order(),
             trade: empty_trade(),
             reject: empty_reject(),
+            balance_ack: empty_ack(),
+            balance_changed: empty_changed(),
         }
     }
 }
@@ -189,6 +261,27 @@ fn empty_order() -> EventOrder {
         side: Side::Bid,
         order_state: 0,
         cl_ord_id: [b' '; 14],
+        cancel_reason: 0,
+    }
+}
+
+fn empty_ack() -> EventBalanceAck {
+    EventBalanceAck {
+        channel: 0,
+        seq: 0,
+        engine_seq: 0,
+        kind: 0,
+        reason: 0,
+    }
+}
+
+fn empty_changed() -> EventBalanceChanged {
+    EventBalanceChanged {
+        account: 0,
+        asset: 0,
+        balance: 0,
+        locked: 0,
+        engine_seq: 0,
     }
 }
 
@@ -237,9 +330,16 @@ mod tests {
             side: Side::Ask,
             order_state: b'L',
             cl_ord_id: [b'Z'; 14],
+            cancel_reason: 0,
         };
         assert_eq!(Event::accepted(1, order).ty, EventType::OrderAccepted);
         assert_eq!(Event::cancelled(1, order).ty, EventType::OrderCancelled);
+        assert_eq!(
+            Event::cancelled_with_reason(1, order, 0x200)
+                .order
+                .cancel_reason,
+            0x200
+        );
         assert_eq!(Event::modified(1, order).ty, EventType::OrderModified);
         assert_eq!(
             Event::rejected(
@@ -268,8 +368,17 @@ mod tests {
             .ty,
             EventType::TradeExecuted
         );
-        let reset = Event::reset();
-        assert_eq!(reset.ty, EventType::BookReset);
-        assert_eq!(reset.client_fd, -1);
+        assert_eq!(
+            Event::balance_ack(EventBalanceAck {
+                channel: 1,
+                seq: 2,
+                engine_seq: 3,
+                kind: 0,
+                reason: 0,
+            })
+            .ty,
+            EventType::BalanceAck
+        );
+        assert_eq!(Event::reset().ty, EventType::BookReset);
     }
 }

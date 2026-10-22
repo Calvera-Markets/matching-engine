@@ -1,6 +1,7 @@
 //! Matching engine shell around `calvera-books`.
 
 pub mod balance;
+pub mod cancel_reason;
 pub mod codec;
 pub mod egress;
 pub mod engine;
@@ -13,7 +14,7 @@ pub mod spsc;
 pub mod types;
 pub mod wal;
 
-pub use balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
+pub use balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
 #[cfg(feature = "itch")]
 pub use codec::itch;
 #[cfg(feature = "ouch")]
@@ -22,7 +23,7 @@ pub use engine::MatchingEngine;
 pub use entry::Entry;
 pub use snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 pub use spsc::Spsc;
-pub use types::{Command, CommandType, Event, EventType};
+pub use types::{Command, CommandType, Event, EventBalanceAck, EventBalanceChanged, EventType};
 
 #[inline(always)]
 pub fn pause() {

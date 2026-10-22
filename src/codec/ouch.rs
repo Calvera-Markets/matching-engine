@@ -84,7 +84,7 @@ pub fn serialize(evt: &Event, out: &mut [u8]) -> usize {
         EventType::OrderModified => write_modified(evt, out),
         EventType::OrderRejected => write_rejected(evt, out),
         EventType::TradeExecuted => write_executed(evt, out),
-        EventType::BookReset => 0,
+        EventType::BookReset | EventType::BalanceAck | EventType::BalanceChanged => 0,
     }
 }
 
@@ -198,6 +198,7 @@ mod tests {
             side,
             order_state: b'L',
             cl_ord_id: [b'C'; 14],
+            cancel_reason: 0,
         }
     }
 

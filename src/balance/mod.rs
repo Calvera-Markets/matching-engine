@@ -8,10 +8,20 @@ mod null;
 
 pub use null::NoCheck;
 
+// re-export for impls
+
 use calvera_books::{Price, Side};
 
 use crate::entry::Entry;
 use crate::snapshot::SnapshotSink;
+use crate::types::{EventBalanceAck, EventBalanceChanged};
+
+/// One private output from the balance check after a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceOutput {
+    Ack(EventBalanceAck),
+    Changed(EventBalanceChanged),
+}
 
 /// Engine identity of an order: the session it came from and its reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -64,6 +74,12 @@ pub trait BalanceCheck {
     /// Write durable check state after the book section of a snapshot.
     /// Transient buffers are skipped.
     fn write_snapshot(&self, out: &mut SnapshotSink);
+
+    /// Drain private balance outputs produced by the last `apply_entry` / settle.
+    /// Default: nothing. `NoCheck` stays a no-op.
+    fn take_outputs(&mut self) -> Vec<BalanceOutput> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

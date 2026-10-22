@@ -894,6 +894,7 @@ mod tests {
                 side: Side::Bid,
                 order_state: b'L',
                 cl_ord_id: Inner::pad_clord("ORD1"),
+                cancel_reason: 0,
             },
         );
         let n = fix.encode_event(&acc, &mut reply);
@@ -939,6 +940,7 @@ mod tests {
             side,
             order_state: b'0',
             cl_ord_id: Inner::pad_clord("FALLBACK"),
+            cancel_reason: 0,
         };
         match ty {
             EventType::OrderAccepted => Event::accepted(SID.0, order),
@@ -1128,6 +1130,7 @@ mod tests {
                 side: Side::Ask,
                 order_state: b'0',
                 cl_ord_id: Inner::pad_clord("ORD9"),
+                cancel_reason: 0,
             },
         );
         assert_eq!(er_tag(&mut fix, &ask, &mut reply, 54).as_deref(), Some("2"));
