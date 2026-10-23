@@ -31,10 +31,7 @@ impl Segment {
             .truncate(true)
             .open(&path)?;
         if prep.preallocates() {
-            let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            matching_engine::wal::reserve_blocks(&file, len as u64)?;
         } else {
             file.set_len(len as u64)?;
         }

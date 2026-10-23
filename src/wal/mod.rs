@@ -27,7 +27,7 @@ pub use frame::{FRAME, WAL_VERSION};
 pub use header::{HEADER, SEGMENT_VERSION};
 pub use mode::Mode;
 pub use preparer::WalMonitor;
-pub use segment::Prep;
+pub use segment::{Prep, reserve_blocks};
 pub use stats::WalStats;
 
 use frame::{CHAIN_SEED, WalFrame};

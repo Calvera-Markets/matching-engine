@@ -22,7 +22,7 @@ unsafe impl Send for Segment {}
 /// How a new segment file is readied before the engine writes to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Prep {
-    /// Reserve blocks with `fallocate` instead of a sparse `ftruncate`.
+    /// Reserve real blocks up front instead of a sparse `set_len`.
     pub preallocate: bool,
     /// Write every page once so no page faults land on the writer.
     pub prefault: bool,
@@ -47,10 +47,7 @@ impl Segment {
             .create_new(true)
             .open(&path)?;
         if prep.preallocate {
-            let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            reserve_blocks(&file, len as u64)?;
         } else {
             file.set_len(len as u64)?;
         }
@@ -151,6 +148,59 @@ impl Segment {
         }
         Ok(())
     }
+}
+
+/// Reserve `len` bytes on disk and set the file to that length.
+///
+/// Linux uses `fallocate`, which allocates the range and extends the file.
+/// macOS `F_PREALLOCATE` only reserves blocks, so the length is set afterwards.
+#[cfg(target_os = "linux")]
+pub fn reserve_blocks(file: &File, len: u64) -> io::Result<()> {
+    let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, len as libc::off_t) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Reserve `len` bytes on disk and set the file to that length.
+///
+/// Linux uses `fallocate`, which allocates the range and extends the file.
+/// macOS `F_PREALLOCATE` only reserves blocks, so the length is set afterwards.
+#[cfg(target_os = "macos")]
+pub fn reserve_blocks(file: &File, len: u64) -> io::Result<()> {
+    // Contiguous space often fails on a fragmented volume; any layout is enough.
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: len as libc::off_t,
+        fst_bytesalloc: 0,
+    };
+    let fd = file.as_raw_fd();
+    let rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+    if rc == -1 || store.fst_bytesalloc < len as libc::off_t {
+        store.fst_flags = libc::F_ALLOCATEALL;
+        store.fst_bytesalloc = 0;
+        let rc = unsafe { libc::fcntl(fd, libc::F_PREALLOCATE, &mut store) };
+        if rc == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if store.fst_bytesalloc < len as libc::off_t {
+            return Err(io::Error::other("preallocate fell short"));
+        }
+    }
+    file.set_len(len)
+}
+
+/// Reserve `len` bytes on disk and set the file to that length.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn reserve_blocks(file: &File, len: u64) -> io::Result<()> {
+    let _ = (file, len);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "reserving segment blocks is implemented on linux and macos",
+    ))
 }
 
 impl Drop for Segment {
