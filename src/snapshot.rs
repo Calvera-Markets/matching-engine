@@ -67,3 +67,18 @@ impl SnapshotSink {
         Snapshot::new(self.buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_round_trip_and_default_is_empty() {
+        let mut sink = SnapshotSink::default();
+        sink.write_u8(7);
+        let snap = sink.finish();
+        assert_eq!(snap.as_bytes(), &[7]);
+        assert_eq!(snap.into_bytes(), vec![7]);
+        assert!(SnapshotSink::default().finish().as_bytes().is_empty());
+    }
+}

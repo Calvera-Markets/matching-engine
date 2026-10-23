@@ -32,11 +32,10 @@ struct Config {
     slab: usize,
 }
 
+#[rustfmt::skip]
 fn main() {
     let code = launch(std::env::args().skip(1));
-    if code != 0 {
-        std::process::exit(code);
-    }
+    if code != 0 { std::process::exit(code) }
 }
 
 fn launch(args: impl Iterator<Item = String>) -> i32 {

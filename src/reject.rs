@@ -29,3 +29,16 @@ pub const fn check_code(reason: u16) -> Option<u8> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_check_range_decodes() {
+        assert_eq!(check_code(0), None);
+        assert_eq!(check_code(CHECK_BASE - 1), None);
+        assert_eq!(check_code(check(7)), Some(7));
+        assert_eq!(check_code(CHECK_BASE + u8::MAX as u16 + 1), None);
+    }
+}

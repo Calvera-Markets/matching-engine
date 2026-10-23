@@ -51,3 +51,35 @@ impl<B: BalanceCheck> MatchGate for EngineGate<'_, B> {
         }
     }
 }
+
+/// Admit a maker the engine has no record of. Used to exercise the gate for a
+/// check that otherwise only sees orders it placed itself.
+#[cfg(test)]
+pub(crate) fn admit_untracked<B: BalanceCheck>(check: &mut B) -> Admit {
+    use calvera_books::{MakerRef, MatchGate, Price, SlabIndex};
+    use std::num::NonZeroU32;
+
+    let by_handle = HashMap::new();
+    let by_client = HashMap::new();
+    let mut uncovered = Vec::new();
+    let mut gate = EngineGate {
+        check,
+        by_handle: &by_handle,
+        by_client: &by_client,
+        taker: OrderRef {
+            client_fd: 1,
+            user_ref: 1,
+        },
+        taker_side: Side::Bid,
+        uncovered: &mut uncovered,
+    };
+    let handle = OrderHandle::new(Side::Bid, SlabIndex::new(1), NonZeroU32::MIN);
+    gate.admit(
+        MakerRef {
+            handle,
+            price: Price(10),
+            resting: 1,
+        },
+        1,
+    )
+}

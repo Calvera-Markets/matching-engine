@@ -136,10 +136,11 @@ impl Wal {
             return Ok(());
         }
         let room = self.offset + FRAME <= self.end;
-        match self.mode {
-            Mode::CancelOnly if room => admit_cancel_only(cmd),
-            Mode::CancelOnly | Mode::RejectAll => self.enter_reserve(cmd),
-            Mode::Normal => Ok(()),
+        // `write` only calls this once `mode` has left Normal.
+        if self.mode == Mode::CancelOnly && room {
+            admit_cancel_only(cmd)
+        } else {
+            self.enter_reserve(cmd)
         }
     }
 

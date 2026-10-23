@@ -43,8 +43,8 @@ impl BalanceCheck for Budget {
         }
     }
 
-    fn on_place(&mut self, _order: &PlaceCtx) -> Result<(), u8> {
-        Ok(())
+    fn on_place(&mut self, order: &PlaceCtx) -> Result<(), u8> {
+        if order.quantity == 0 { Err(9) } else { Ok(()) }
     }
 
     fn on_fill(&mut self, fill: &FillCtx) {
@@ -78,18 +78,22 @@ impl BalanceCheck for Budget {
     }
 }
 
-fn open(wal: &TempWal) -> (MatchingEngine<Budget>, Arc<Spsc<Event>>) {
+fn open_slab(wal: &TempWal, slab: usize) -> (MatchingEngine<Budget>, Arc<Spsc<Event>>) {
     let ouch = Arc::new(Spsc::new(256));
     let eng = MatchingEngine::with_check(
         Arc::new(Spsc::new(8)),
         ouch.clone(),
         Arc::new(Spsc::new(256)),
         &wal.config(64 * 1024),
-        64,
+        slab,
         Budget::default(),
     )
     .unwrap();
     (eng, ouch)
+}
+
+fn open(wal: &TempWal) -> (MatchingEngine<Budget>, Arc<Spsc<Event>>) {
+    open_slab(wal, 64)
 }
 
 fn budget(fd: i32, units: u64) -> Command {
@@ -193,6 +197,40 @@ fn uncovered_taker_stops_and_its_remainder_is_cancelled() {
         of(&ev, EventType::TradeExecuted)
             .iter()
             .any(|t| t.trade.quantity == 2 && t.trade.price == Price(101))
+    );
+}
+
+#[test]
+fn place_duplicate_and_slab_misses_are_rejected() {
+    let wal = TempWal::new("gate-place");
+    let (mut eng, ouch) = open(&wal);
+    eng.step(&add(1, 1, Side::Bid, 100, 0));
+    let ev = drain(&ouch);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].reject.reason, crate::reject::check(9));
+
+    eng.step(&add(1, 1, Side::Bid, 100, 1));
+    eng.step(&add(1, 1, Side::Bid, 101, 1));
+    let ev = drain(&ouch);
+    assert_eq!(ev[1].ty, EventType::OrderRejected);
+    assert_eq!(ev[1].reject.reason, crate::reject::DUPLICATE_KEY);
+
+    let wal = TempWal::new("gate-slab");
+    let (mut eng, ouch) = open_slab(&wal, 2);
+    eng.step(&add(1, 1, Side::Bid, 100, 1));
+    eng.step(&add(1, 2, Side::Bid, 101, 1));
+    let ev = drain(&ouch);
+    assert_eq!(ev[1].reject.reason, crate::reject::SLAB_FULL);
+}
+
+#[test]
+fn an_untracked_maker_is_admitted() {
+    let wal = TempWal::new("gate-untracked");
+    let (mut eng, _) = open(&wal);
+    assert!(eng.drop_untracked_uncovered());
+    assert_eq!(
+        crate::engine::admit_untracked(eng.check_mut()),
+        calvera_books::Admit::Fill
     );
 }
 

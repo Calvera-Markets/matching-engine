@@ -379,6 +379,15 @@ mod tests {
             .ty,
             EventType::BalanceAck
         );
+        let changed = Event::balance_changed(EventBalanceChanged {
+            account: 9,
+            asset: 1,
+            balance: 50,
+            locked: 10,
+            engine_seq: 4,
+        });
+        assert_eq!(changed.ty, EventType::BalanceChanged);
+        assert_eq!(changed.balance_changed.balance, 50);
         assert_eq!(Event::reset().ty, EventType::BookReset);
     }
 }

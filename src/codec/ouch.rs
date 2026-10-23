@@ -292,11 +292,10 @@ mod tests {
                 ..
             }
         ));
-        if let ParseOutcome::Command { cmd, consumed } = outcome {
-            assert_eq!(consumed, ENTER_LEN);
-            assert_eq!(cmd.client_fd, 5);
-            assert_eq!(cmd.ty, CommandType::Add);
-        }
+        let (cmd, consumed) = parse(&buf, 5).unwrap();
+        assert_eq!(consumed, ENTER_LEN);
+        assert_eq!(cmd.client_fd, 5);
+        assert_eq!(cmd.ty, CommandType::Add);
     }
 
     #[test]

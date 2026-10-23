@@ -170,3 +170,74 @@ impl std::error::Error for GateError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::io;
+
+    #[test]
+    fn messages_name_the_failure() {
+        let io_msg = |e: &dyn Error| e.to_string();
+        let disk = || io::Error::other("disk");
+
+        let wal_io = WalError::Io(disk());
+        assert!(io_msg(&wal_io).contains("disk"));
+        assert!(wal_io.source().is_some());
+        assert!(WalError::Full.source().is_none());
+        let wal = [
+            WalError::Full.to_string(),
+            WalError::CancelOnly.to_string(),
+            WalError::Version { seq: 3, found: 9 }.to_string(),
+            WalError::Gap {
+                expected: 1,
+                found: 4,
+            }
+            .to_string(),
+            WalError::Corrupt {
+                segment: 2,
+                offset: 64,
+            }
+            .to_string(),
+            WalError::Config("missing".into()).to_string(),
+            WalError::StaleEpoch {
+                index: 1,
+                found: 8,
+                expected: 1,
+            }
+            .to_string(),
+            WalError::MissingSegment {
+                expected: 1,
+                found: 3,
+            }
+            .to_string(),
+            WalError::BrokenChain { index: 2 }.to_string(),
+            WalError::BadHeader {
+                path: PathBuf::from("000.seg"),
+            }
+            .to_string(),
+            WalError::SegmentVersion { found: 9 }.to_string(),
+        ];
+        assert!(wal.iter().all(|m| m.starts_with("wal ")));
+
+        let from_io: WalError = disk().into();
+        assert!(matches!(from_io, WalError::Io(_)));
+
+        let replica_io = ReplicaError::Io(disk());
+        assert!(io_msg(&replica_io).contains("disk"));
+        assert!(replica_io.source().is_some());
+        let down = ReplicaError::Unavailable("down".into());
+        assert!(down.to_string().contains("down"));
+        assert!(down.source().is_none());
+        let from_io: ReplicaError = disk().into();
+        assert!(matches!(from_io, ReplicaError::Io(_)));
+
+        let spawn = GateError::Spawn(disk());
+        assert!(io_msg(&spawn).contains("disk"));
+        assert!(spawn.source().is_some());
+        let cfg = GateError::Config("ring".into());
+        assert!(cfg.to_string().contains("ring"));
+        assert!(cfg.source().is_none());
+    }
+}

@@ -120,8 +120,7 @@ impl Spares {
     #[inline]
     pub fn retire(&mut self, done: Segment) {
         if let Err(done) = self.shared.retired.try_push(done) {
-            Counters::bump(&self.shared.counters.inline_retires);
-            drop(done);
+            let _ = (Counters::bump(&self.shared.counters.inline_retires), done);
         }
     }
 
@@ -179,8 +178,7 @@ impl Helper {
         {
             let seg = Segment::create(&self.dir, self.next_name, self.len, self.prep)?;
             self.next_name += 1;
-            if let Err(seg) = self.shared.ready.try_push(seg) {
-                drop(seg);
+            if self.shared.ready.try_push(seg).is_err() {
                 break;
             }
             Counters::bump(&self.shared.counters.prepared);
@@ -188,9 +186,7 @@ impl Helper {
         if !self.shared.held.load(Ordering::Acquire) && self.shared.reserve.is_empty() {
             let seg = Segment::create(&self.dir, self.next_name, self.reserve_len, self.prep)?;
             self.next_name += 1;
-            if let Err(seg) = self.shared.reserve.try_push(seg) {
-                drop(seg);
-            }
+            let _ = self.shared.reserve.try_push(seg);
         }
         Ok(())
     }
@@ -202,9 +198,9 @@ impl Helper {
             any = true;
             if self.seal_sync && seg.sync().is_err() {
                 Counters::bump(&self.shared.counters.seal_failures);
-                continue;
+            } else {
+                Counters::bump(&self.shared.counters.sealed);
             }
-            Counters::bump(&self.shared.counters.sealed);
         }
         any
     }

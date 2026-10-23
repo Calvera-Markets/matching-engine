@@ -244,4 +244,9 @@ mod tests {
         assert_eq!(delete(&ev, &mut wide), 19);
         assert_eq!(wide[0], b'D');
     }
+
+    #[test]
+    fn default_packet_is_empty() {
+        assert!(Packet::default().take().is_none());
+    }
 }

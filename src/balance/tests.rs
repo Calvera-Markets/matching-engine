@@ -141,6 +141,85 @@ fn drain(q: &Spsc<Event>) -> Vec<Event> {
 }
 
 #[test]
+fn default_hooks_admit_and_ignore_a_refusal() {
+    use super::{BalanceCheck, MatchCtx, NoCheck, Verdict};
+    use calvera_books::{Price, Side};
+
+    let ctx = MatchCtx {
+        taker: order(1, 1),
+        taker_side: Side::Bid,
+        maker: order(2, 2),
+        price: Price(10),
+        quantity: 1,
+    };
+    let entry = Entry {
+        kind: 0,
+        tag: 0,
+        channel: 0,
+        words: [0; 4],
+    };
+    let mut bare = NoCheck;
+    assert_eq!(bare.admit(&ctx), Verdict::Fill);
+    bare.apply_entry(&entry);
+    bare.refuse_entry(&entry, 1);
+    assert!(bare.take_outputs().is_empty());
+
+    struct Defaults;
+    impl BalanceCheck for Defaults {
+        type Error = ();
+        fn on_place(&mut self, _: &super::PlaceCtx) -> Result<(), ()> {
+            Ok(())
+        }
+        fn on_fill(&mut self, _: &FillCtx) {}
+        fn on_done(&mut self, _: OrderRef) {}
+        fn apply_entry(&mut self, _: &Entry) {}
+        fn on_reset(&mut self) {}
+        fn reject_code(_: ()) -> u8 {
+            0
+        }
+        fn write_snapshot(&self, _: &mut crate::snapshot::SnapshotSink) {}
+    }
+    let mut defaults = Defaults;
+    assert_eq!(defaults.admit(&ctx), Verdict::Fill);
+    defaults.refuse_entry(&entry, 4);
+    assert!(defaults.take_outputs().is_empty());
+}
+
+#[test]
+fn a_balance_change_is_sequenced_on_the_private_ring() {
+    use super::BalanceOutput;
+    use crate::types::EventBalanceChanged;
+
+    let wal = TempWal::new("changed");
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    eng.check_mut()
+        .pending
+        .push(BalanceOutput::Changed(EventBalanceChanged {
+            account: 7,
+            asset: 1,
+            balance: 40,
+            locked: 5,
+            engine_seq: 0,
+        }));
+    eng.step(
+        &Entry {
+            kind: 1,
+            tag: 0,
+            channel: 1,
+            words: [0; 4],
+        }
+        .to_command(),
+    );
+    let changed = drain(&ouch)
+        .into_iter()
+        .find(|e| e.ty == EventType::BalanceChanged)
+        .unwrap();
+    assert_eq!(changed.balance_changed.account, 7);
+    assert_eq!(changed.balance_changed.engine_seq, 1);
+    assert_eq!(changed.balance_changed.balance, 40);
+}
+
+#[test]
 fn a_refused_order_never_reaches_the_book() {
     let wal = TempWal::new("check-refuse");
     let (mut eng, ouch) = open(&wal, 64, 5);
@@ -319,5 +398,36 @@ fn an_entry_the_log_refuses_is_reported_and_not_applied() {
     assert_eq!(
         calls.iter().filter(|c| matches!(c, Call::Entry(_))).count(),
         2
+    );
+    eng.step(&add(1, 1, Side::Bid, 100, 1));
+    let ev = drain(&ouch);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].ty, EventType::OrderRejected);
+    assert_eq!(ev[0].reject.reason, reject::JOURNAL_CANCEL_ONLY);
+}
+
+#[test]
+fn modify_and_poison_are_applied() {
+    let wal = TempWal::new("check-mod");
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    eng.step(&add(1, 1, Side::Bid, 100, 4));
+    let mut modify = Command::blank(CommandType::Modify);
+    modify.client_fd = 1;
+    modify.user_ref = 1;
+    modify.side = Side::Ask;
+    modify.price = Price(110);
+    modify.quantity = 2;
+    eng.step(&modify);
+    eng.step(&Command::poison());
+    let ev = drain(&ouch);
+    assert!(
+        ev.iter()
+            .any(|e| e.ty == EventType::OrderAccepted && e.order.side == Side::Ask)
+    );
+    assert!(
+        eng.check()
+            .calls
+            .iter()
+            .any(|c| matches!(c, Call::Place(_)))
     );
 }

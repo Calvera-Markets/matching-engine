@@ -2,6 +2,9 @@
 
 mod gate;
 
+#[cfg(test)]
+pub(crate) use gate::admit_untracked;
+
 use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
@@ -557,6 +560,23 @@ impl<B: BalanceCheck, J: Journal> MatchingEngine<B, J> {
     }
 }
 
+#[cfg(test)]
+impl<B: BalanceCheck> MatchingEngine<B> {
+    /// Forget a maker the book no longer has, and one the engine never tracked.
+    pub(crate) fn drop_untracked_uncovered(&mut self) -> bool {
+        use calvera_books::SlabIndex;
+        use std::num::NonZeroU32;
+        let generation = NonZeroU32::MIN;
+        let known = OrderHandle::new(Side::Bid, SlabIndex::new(7), generation);
+        let missing = OrderHandle::new(Side::Ask, SlabIndex::new(8), generation);
+        self.by_handle.insert(known, u64::MAX);
+        self.uncovered.push(known);
+        self.uncovered.push(missing);
+        self.cancel_uncovered_makers();
+        self.uncovered.is_empty() && !self.by_handle.contains_key(&known)
+    }
+}
+
 fn write_live(out: &mut SnapshotSink, key: u64, live: &Live) {
     out.write_u64(key);
     out.write_u64(live.handle.as_u64());
@@ -945,5 +965,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(eng.wal().seq(), 0);
+    }
+
+    #[test]
+    fn check_mut_reaches_the_check() {
+        let wal = TempWal::new("check-mut");
+        let (mut eng, _, _, _) = open(&wal, 8);
+        let _ = eng.check_mut();
+    }
+
+    #[test]
+    fn an_untracked_maker_is_skipped() {
+        let wal = TempWal::new("gate-skip");
+        let (mut eng, _, _, _) = open(&wal, 8);
+        assert!(eng.drop_untracked_uncovered());
     }
 }

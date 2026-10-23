@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::MetadataExt;
 use std::ptr;
 
 use calvera_books::{Price, Side};
@@ -343,11 +344,38 @@ fn bad_config_is_refused() {
     let mut cfg = wal.config(HEADER);
     assert!(matches!(open(&cfg), Err(WalError::Config(_))));
     cfg.segment_bytes = HEADER + FRAME;
+    cfg.reserve_bytes = HEADER + FRAME;
     cfg.spares = 0;
-    assert!(matches!(open(&cfg), Err(WalError::Config(_))));
+    assert!(matches!(open(&cfg), Err(ref err) if err.to_string().contains("spares")));
     cfg.spares = 1;
+    cfg.retire_queue = 0;
+    assert!(matches!(
+        open(&cfg),
+        Err(ref err) if err.to_string().contains("retire_queue")
+    ));
+    cfg.retire_queue = 1;
     cfg.dir = cfg.dir.join("nope");
     assert!(matches!(open(&cfg), Err(WalError::Config(_))));
+}
+
+#[test]
+fn reserve_blocks_allocates_the_file() {
+    let wal = TempWal::new("reserve-blocks");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(wal.0.join("one"))
+        .unwrap();
+    let len = 256 * 1024;
+    reserve_blocks(&file, len).unwrap();
+    let meta = file.metadata().unwrap();
+    assert_eq!(meta.len(), len);
+    assert!(
+        meta.blocks() * 512 >= len,
+        "reserved {} bytes for a {len}-byte file",
+        meta.blocks() * 512
+    );
 }
 
 #[test]
@@ -388,8 +416,16 @@ fn flags_build_a_config_and_report_what_is_missing() {
     flags.set("--wal-seal-sync", "on").unwrap();
     flags.set("--wal-preparer-poll-us", "50").unwrap();
     flags.set("--wal-preparer-cpu", "none").unwrap();
+    assert_eq!(flags.clone().build().unwrap().preparer_cpu, None);
+    flags.set("--wal-preparer-cpu", "2").unwrap();
     let cfg = flags.build().unwrap();
-    assert_eq!(cfg.preparer_cpu, None);
+    assert_eq!(cfg.preparer_cpu, Some(2));
+    assert!(WalFlags::default().build().is_err());
+    assert!(WalFlags::new().set("--wal-nope", "1").is_err());
+    assert!(matches!(
+        WalFlags::new().set("--wal-segment-bytes", "nope"),
+        Err(WalError::Config(m)) if m.contains("wal-segment-bytes")
+    ));
     assert!(cfg.seal_sync);
     assert_eq!(cfg.segment_bytes, 1 << 20);
     assert_eq!(cfg.epoch, 3);
@@ -557,4 +593,111 @@ fn reserve_size_is_validated() {
     let mut cfg = small(&wal);
     cfg.reserve_bytes = FRAME;
     assert!(matches!(open(&cfg), Err(WalError::Config(_))));
+}
+
+#[test]
+fn files_that_are_not_segments_are_ignored() {
+    let wal = TempWal::new("seg-stray");
+    let cfg = small(&wal);
+    write_n(&cfg, 2);
+    fs::write(cfg.dir.join("notes.txt"), b"nope").unwrap();
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), 2);
+}
+
+#[test]
+fn a_short_file_is_not_a_segment() {
+    let wal = TempWal::new("seg-short");
+    let path = wal.0.join(super::segment::Segment::file_name(0));
+    fs::write(&path, [0u8; 8]).unwrap();
+    assert!(matches!(
+        super::segment::Segment::open(&path),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+    ));
+}
+
+#[test]
+fn a_header_from_another_version_is_refused() {
+    let wal = TempWal::new("seg-ver");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let segs = segments(&cfg);
+    poke(&segs[0].0, 0, |b| {
+        b[8] = 9;
+        let sum = super::frame::fnv(CHAIN_SEED, &b[8..HEADER]);
+        b[4..8].copy_from_slice(&sum.to_ne_bytes());
+    });
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::SegmentVersion { found: 9 })
+    ));
+}
+
+#[test]
+fn a_segment_that_skips_a_sequence_is_refused() {
+    let wal = TempWal::new("seg-gap");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let segs = segments(&cfg);
+    let h = segs[0].1;
+    let forged = SegmentHeader::new(h.epoch, h.index, h.first_seq + 3, h.prev);
+    poke(&segs[0].0, 0, |b| unsafe {
+        ptr::write_unaligned(b.as_mut_ptr() as *mut SegmentHeader, forged)
+    });
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::Gap {
+            expected: 1,
+            found: 4
+        })
+    ));
+}
+
+#[test]
+fn reserve_blocks_reports_a_file_it_cannot_allocate() {
+    let wal = TempWal::new("reserve-ro");
+    let path = wal.0.join("ro");
+    fs::write(&path, b"").unwrap();
+    let file = OpenOptions::new().read(true).open(&path).unwrap();
+    assert!(reserve_blocks(&file, 4096).is_err());
+}
+
+#[test]
+fn the_preparer_can_be_pinned() {
+    let wal = TempWal::new("seg-cpu");
+    let mut cfg = small(&wal);
+    cfg.preparer_cpu = Some(0);
+    let (mut w, _) = open(&cfg).unwrap();
+    write(&mut w, &add(1));
+    assert_eq!(w.seq(), 1);
+}
+
+#[test]
+fn a_preparer_that_cannot_create_a_segment_counts_the_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let wal = TempWal::new("seg-prep-fail");
+    let mut cfg = small(&wal);
+    cfg.preparer_poll_us = 1_000;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER as u32 + 1) {
+        write(&mut w, &add(user));
+    }
+    fs::set_permissions(&cfg.dir, fs::Permissions::from_mode(0o555)).unwrap();
+    w.hold_spares(false);
+    let start = Instant::now();
+    let failed = loop {
+        if w.stats().prepare_failures > 0 {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    fs::set_permissions(&cfg.dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed);
 }

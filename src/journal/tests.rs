@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use calvera_books::{Price, Side};
 
 use super::*;
-use crate::error::{GateError, ReplicaError};
+use crate::error::{GateError, ReplicaError, WalError};
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event};
 use crate::wal::{FRAME, HEADER, Wal, WalConfig};
@@ -299,4 +299,46 @@ fn gate_config_is_validated() {
         ),
         Err(GateError::Config(_))
     ));
+}
+
+#[test]
+fn verdict_of_maps_wal_results() {
+    assert_eq!(Verdict::of(Ok(())), Verdict::Apply);
+    assert_eq!(
+        Verdict::of(Err(WalError::Full)),
+        Verdict::Refuse(reject::JOURNAL_FULL)
+    );
+    assert_eq!(
+        Verdict::of(Err(WalError::CancelOnly)),
+        Verdict::Refuse(reject::JOURNAL_CANCEL_ONLY)
+    );
+    assert_eq!(
+        Verdict::of(Err(WalError::Config("x".into()))),
+        Verdict::Refuse(reject::JOURNAL_FAULT)
+    );
+}
+
+#[test]
+fn a_zero_retry_and_a_spin_wait_are_rejected_or_idle() {
+    let mut cfg = gate(ReplicaMode::Async);
+    cfg.replica_retry_us = 0;
+    assert!(cfg.validate().is_err());
+    WaitStrategy::Spin.idle();
+    WaitStrategy::Yield.idle();
+}
+
+#[test]
+fn pinned_threads_report_stats_and_exit_on_poison() {
+    let tmp = TempWal::new("gate-pin");
+    let (wal, _) = open_wal(&tmp.config(64 * 1024));
+    let input = Arc::new(Spsc::new(8));
+    let mut cfg = gate(ReplicaMode::Async);
+    cfg.journaller_cpu = Some(0);
+    cfg.replicator_cpu = Some(0);
+    let standby = Standby::new(false);
+    let (mut g, threads) = spawn_gated(&cfg, input.clone(), wal, Some(standby)).unwrap();
+    assert_eq!(threads.stats().published, 0);
+    input.push(Command::blank(CommandType::Poison));
+    drain(&mut g, 1);
+    threads.join().unwrap();
 }
