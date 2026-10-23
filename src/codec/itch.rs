@@ -156,6 +156,7 @@ mod tests {
             side,
             order_state: b'L',
             cl_ord_id: [b'I'; 14],
+            cancel_reason: 0,
         }
     }
 
@@ -242,5 +243,10 @@ mod tests {
         assert_eq!(wide[0], b'E');
         assert_eq!(delete(&ev, &mut wide), 19);
         assert_eq!(wide[0], b'D');
+    }
+
+    #[test]
+    fn default_packet_is_empty() {
+        assert!(Packet::default().take().is_none());
     }
 }

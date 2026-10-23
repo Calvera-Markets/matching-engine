@@ -45,3 +45,6 @@ jobs:
 
       - name: test
         run: just test
+
+      - name: wal_switch smoke
+        run: just wal-bench-smoke "$RUNNER_TEMP"

@@ -11,7 +11,8 @@ fix = ["dep:ironfix-core", "dep:ironfix-tagvalue", "dep:ironfix-session"]
 sbe = ["dep:ironsbe-core", "dep:ironsbe-codegen"]
 
 [dependencies]
-calvera-books = { git = "https://github.com/Calvera-Markets/orderbook.git", tag = "v0.1.1" }
+# TODO: pin to a release tag once Calvera-Markets/orderbook feat/041-check-at-match is merged.
+calvera-books = { git = "https://github.com/Calvera-Markets/orderbook.git", branch = "feat/041-check-at-match" }
 libc = "0.2"
 ironfix-core = { version = "0.4", optional = true }
 ironfix-tagvalue = { version = "0.4", optional = true }
@@ -34,6 +35,11 @@ required-features = ["ouch", "itch"]
 
 [[bench]]
 name = "hot"
+harness = false
+
+[[bench]]
+name = "wal_switch"
+path = "benches/wal_switch/main.rs"
 harness = false
 
 [[example]]

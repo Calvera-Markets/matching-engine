@@ -6,6 +6,13 @@ pub const DUPLICATE_KEY: u16 = 0;
 pub const SLAB_FULL: u16 = 1;
 /// The book reported an internal inconsistency.
 pub const BOOK_FAULT: u16 = 2;
+/// The journal has no spare and no reserve room; the command was not applied.
+pub const JOURNAL_FULL: u16 = 3;
+/// The journal failed for another reason; the command was not applied.
+pub const JOURNAL_FAULT: u16 = 4;
+/// The journal is on its emergency reserve and takes cancels only; the
+/// command was not applied.
+pub const JOURNAL_CANCEL_ONLY: u16 = 5;
 /// Codes at or above this value come from the balance check.
 pub const CHECK_BASE: u16 = 0x0100;
 
@@ -20,5 +27,18 @@ pub const fn check_code(reason: u16) -> Option<u8> {
         Some((reason - CHECK_BASE) as u8)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_check_range_decodes() {
+        assert_eq!(check_code(0), None);
+        assert_eq!(check_code(CHECK_BASE - 1), None);
+        assert_eq!(check_code(check(7)), Some(7));
+        assert_eq!(check_code(CHECK_BASE + u8::MAX as u16 + 1), None);
     }
 }

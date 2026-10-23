@@ -1,7 +1,6 @@
 //! Four pinned threads, three SPSC rings, WAL-before-apply.
 
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -14,14 +13,15 @@ use matching_engine::engine::MatchingEngine;
 use matching_engine::ingress::Ingress;
 use matching_engine::md_pub::MdPub;
 use matching_engine::types::{Command, Event};
-use matching_engine::{Spsc, lock_memory, pin_to_cpu};
+use matching_engine::wal::FLAGS_USAGE;
+use matching_engine::{Spsc, WalConfig, WalFlags, lock_memory, pin_to_cpu};
 
 const CMD_Q: usize = 1 << 20;
 const EVT_Q: usize = 1 << 20;
 
 struct Config {
     port: u16,
-    wal: PathBuf,
+    wal: WalConfig,
     itch_ip: Ipv4Addr,
     itch_port: u16,
     itch_iface: Ipv4Addr,
@@ -32,11 +32,10 @@ struct Config {
     slab: usize,
 }
 
+#[rustfmt::skip]
 fn main() {
     let code = launch(std::env::args().skip(1));
-    if code != 0 {
-        std::process::exit(code);
-    }
+    if code != 0 { std::process::exit(code) }
 }
 
 fn launch(args: impl Iterator<Item = String>) -> i32 {
@@ -135,18 +134,16 @@ fn serve(args: impl Iterator<Item = String>, running: Arc<AtomicBool>) -> Result
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, i32> {
-    let mut cfg = Config {
-        port: 12345,
-        wal: PathBuf::from("orderbook.wal"),
-        itch_ip: Ipv4Addr::new(239, 0, 0, 1),
-        itch_port: 5000,
-        itch_iface: Ipv4Addr::LOCALHOST,
-        cpu_ingress: 8,
-        cpu_engine: 10,
-        cpu_egress: 12,
-        cpu_itch: 14,
-        slab: 1 << 20,
-    };
+    let mut wal = WalFlags::new();
+    let mut port = 12345;
+    let mut itch_ip = Ipv4Addr::new(239, 0, 0, 1);
+    let mut itch_port = 5000;
+    let mut itch_iface = Ipv4Addr::LOCALHOST;
+    let mut cpu_ingress = 8;
+    let mut cpu_engine = 10;
+    let mut cpu_egress = 12;
+    let mut cpu_itch = 14;
+    let mut slab = 1 << 20;
 
     while let Some(a) = args.next() {
         let mut take = || -> Result<String, i32> {
@@ -156,20 +153,23 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, i32> {
             })
         };
         match a.as_str() {
-            "-p" | "--port" => cfg.port = take()?.parse().unwrap(),
-            "-w" | "--wal" => cfg.wal = PathBuf::from(take()?),
-            "--itch-ip" => cfg.itch_ip = take()?.parse().unwrap(),
-            "--itch-port" => cfg.itch_port = take()?.parse().unwrap(),
-            "--itch-iface" => cfg.itch_iface = take()?.parse().unwrap(),
-            "-i" | "--cpu-ingress" => cfg.cpu_ingress = take()?.parse().unwrap(),
-            "-e" | "--cpu-engine" => cfg.cpu_engine = take()?.parse().unwrap(),
-            "-o" | "--cpu-egress" => cfg.cpu_egress = take()?.parse().unwrap(),
-            "-m" | "--cpu-itch" => cfg.cpu_itch = take()?.parse().unwrap(),
-            "--slab" => cfg.slab = take()?.parse().unwrap(),
+            "-p" | "--port" => port = take()?.parse().unwrap(),
+            flag if WalFlags::owns(flag) => wal.set(flag, &take()?).map_err(|e| {
+                eprintln!("{e}");
+                2
+            })?,
+            "--itch-ip" => itch_ip = take()?.parse().unwrap(),
+            "--itch-port" => itch_port = take()?.parse().unwrap(),
+            "--itch-iface" => itch_iface = take()?.parse().unwrap(),
+            "-i" | "--cpu-ingress" => cpu_ingress = take()?.parse().unwrap(),
+            "-e" | "--cpu-engine" => cpu_engine = take()?.parse().unwrap(),
+            "-o" | "--cpu-egress" => cpu_egress = take()?.parse().unwrap(),
+            "-m" | "--cpu-itch" => cpu_itch = take()?.parse().unwrap(),
+            "--slab" => slab = take()?.parse().unwrap(),
             "-h" | "--help" => {
                 eprintln!(
-                    "matching-engine [--port 12345] [--wal orderbook.wal]\n\
-                     [--itch-ip 239.0.0.1] [--itch-port 5000] [--itch-iface 127.0.0.1]\n\
+                    "matching-engine {FLAGS_USAGE}\n\
+                     [--port 12345] [--itch-ip 239.0.0.1] [--itch-port 5000] [--itch-iface 127.0.0.1]\n\
                      [--cpu-ingress 8] [--cpu-engine 10] [--cpu-egress 12] [--cpu-itch 14]\n\
                      [--slab 1048576]"
                 );
@@ -181,7 +181,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Config, i32> {
             }
         }
     }
-    Ok(cfg)
+    let wal = wal.build().map_err(|e| {
+        eprintln!("{e}");
+        2
+    })?;
+    Ok(Config {
+        port,
+        wal,
+        itch_ip,
+        itch_port,
+        itch_iface,
+        cpu_ingress,
+        cpu_engine,
+        cpu_egress,
+        cpu_itch,
+        slab,
+    })
 }
 
 fn ctrlc_or_signal(running: Arc<AtomicBool>) {
@@ -210,16 +225,60 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Instant;
 
-    struct Rm(PathBuf);
+    struct Rm(std::path::PathBuf);
+
+    impl Rm {
+        fn dir(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("me-bin-{label}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn flags(&self) -> Vec<String> {
+            wal_flags(self.0.to_str().unwrap())
+        }
+    }
 
     impl Drop for Rm {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn wal_flags(dir: &str) -> Vec<String> {
+        args(&[
+            "--wal-dir",
+            dir,
+            "--wal-epoch",
+            "1",
+            "--wal-segment-bytes",
+            "65536",
+            "--wal-spares",
+            "1",
+            "--wal-reserve-bytes",
+            "4096",
+            "--wal-preallocate",
+            "off",
+            "--wal-prefault",
+            "off",
+            "--wal-retire-queue",
+            "4",
+            "--wal-seal-sync",
+            "off",
+            "--wal-preparer-poll-us",
+            "100",
+            "--wal-preparer-cpu",
+            "none",
+        ])
     }
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    fn with(mut base: Vec<String>, more: &[&str]) -> Vec<String> {
+        base.extend(args(more));
+        base
     }
 
     fn idle_flag() -> Arc<AtomicBool> {
@@ -233,37 +292,34 @@ mod tests {
         assert_eq!(serve(args(&["--nope"]).into_iter(), idle_flag()), Err(2));
         assert_eq!(serve(args(&["--slab"]).into_iter(), idle_flag()), Err(2));
         assert_eq!(serve(args(&["-p"]).into_iter(), idle_flag()), Err(2));
+        assert_eq!(
+            serve(args(&["--wal-dir", "/tmp"]).into_iter(), idle_flag()),
+            Err(2)
+        );
+        assert_eq!(
+            serve(args(&["--wal-prefault", "maybe"]).into_iter(), idle_flag()),
+            Err(2)
+        );
     }
 
     #[test]
     fn bad_wal_bind_and_itch_address_fail() {
-        let missing = serve(
-            args(&["--wal", "/no/such/me-bin-dir/book.wal"]).into_iter(),
-            idle_flag(),
-        );
+        let missing = serve(wal_flags("/no/such/me-bin-dir").into_iter(), idle_flag());
         assert_eq!(missing, Err(1));
 
-        let wal = Rm(std::env::temp_dir().join(format!("me-bin-bind-{}.wal", std::process::id())));
+        let wal = Rm::dir("bind");
         let held = TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let port = held.local_addr().unwrap().port().to_string();
         let bound = serve(
-            args(&["--port", &port, "--wal", wal.0.to_str().unwrap()]).into_iter(),
+            with(wal.flags(), &["--port", &port]).into_iter(),
             idle_flag(),
         );
         assert_eq!(bound, Err(1));
         drop(held);
 
-        let wal = Rm(std::env::temp_dir().join(format!("me-bin-itch-{}.wal", std::process::id())));
+        let wal = Rm::dir("itch");
         let itch = serve(
-            args(&[
-                "--port",
-                "0",
-                "--wal",
-                wal.0.to_str().unwrap(),
-                "--itch-iface",
-                "192.0.2.1",
-            ])
-            .into_iter(),
+            with(wal.flags(), &["--port", "0", "--itch-iface", "192.0.2.1"]).into_iter(),
             idle_flag(),
         );
         assert_eq!(itch, Err(1));
@@ -275,34 +331,35 @@ mod tests {
         let port = probe.local_addr().unwrap().port().to_string();
         let port_arg = port.clone();
         drop(probe);
-        let wal = Rm(std::env::temp_dir().join(format!("me-bin-live-{}.wal", std::process::id())));
+        let wal = Rm::dir("live");
         let running = idle_flag();
         let flag = running.clone();
-        let wal_arg = wal.0.to_str().unwrap().to_string();
+        let wal_args = wal.flags();
         let handle = thread::spawn(move || {
             serve(
-                args(&[
-                    "--port",
-                    &port_arg,
-                    "--wal",
-                    &wal_arg,
-                    "--itch-ip",
-                    "239.0.0.1",
-                    "--itch-port",
-                    "5000",
-                    "--itch-iface",
-                    "127.0.0.1",
-                    "--cpu-ingress",
-                    "0",
-                    "--cpu-engine",
-                    "0",
-                    "--cpu-egress",
-                    "0",
-                    "--cpu-itch",
-                    "0",
-                    "--slab",
-                    "1024",
-                ])
+                with(
+                    wal_args,
+                    &[
+                        "--port",
+                        &port_arg,
+                        "--itch-ip",
+                        "239.0.0.1",
+                        "--itch-port",
+                        "5000",
+                        "--itch-iface",
+                        "127.0.0.1",
+                        "--cpu-ingress",
+                        "0",
+                        "--cpu-engine",
+                        "0",
+                        "--cpu-egress",
+                        "0",
+                        "--cpu-itch",
+                        "0",
+                        "--slab",
+                        "1024",
+                    ],
+                )
                 .into_iter(),
                 running,
             )

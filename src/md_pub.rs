@@ -83,6 +83,7 @@ mod tests {
                 side: Side::Bid,
                 order_state: b'L',
                 cl_ord_id: [b'M'; 14],
+                cancel_reason: 0,
             },
         )
     }

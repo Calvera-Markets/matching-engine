@@ -234,14 +234,13 @@ mod tests {
     }
 
     fn accept_ready(ing: &mut Ingress<impl OrderEntry>) {
-        for _ in 0..50 {
+        let mut left = 50;
+        while ing.clients.is_empty() {
             ing.accept_all();
             thread_sleep();
-            if !ing.clients.is_empty() {
-                return;
-            }
+            left -= 1;
+            assert!(left > 0, "client was not accepted");
         }
-        assert!(!ing.clients.is_empty());
     }
 
     fn await_cmd(ing: &mut Ingress<impl OrderEntry>, cmds: &Spsc<Command>) -> Command {
@@ -342,6 +341,29 @@ mod tests {
         client.write_all(&[1]).unwrap();
         await_gone(&mut ing);
         assert_eq!(ing.oe.ended.len(), 2);
+
+        let client = connect_to(&ing);
+        client.set_nonblocking(true).unwrap();
+        accept_ready(&mut ing);
+        drop(client);
+        await_gone(&mut ing);
+        assert_eq!(ing.oe.ended.len(), 3);
+
+        let client = connect_to(&ing);
+        client.set_nonblocking(true).unwrap();
+        accept_ready(&mut ing);
+        let fd = *ing.clients.keys().next().unwrap();
+        let wal = crate::TempWal::new("ingress-script-fd");
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(wal.0.join("fd"))
+            .unwrap();
+        unsafe { libc::dup2(file.as_raw_fd(), fd) };
+        ing.read_all();
+        assert!(ing.clients.is_empty());
+        assert_eq!(ing.oe.ended.len(), 4);
     }
 
     #[test]
@@ -378,7 +400,7 @@ mod tests {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&wal.0)
+            .open(wal.0.join("fd"))
             .unwrap();
         unsafe {
             libc::dup2(file.as_raw_fd(), fd);

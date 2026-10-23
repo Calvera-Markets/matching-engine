@@ -103,6 +103,7 @@ mod tests {
                 side,
                 order_state: b'L',
                 cl_ord_id: [b'E'; 14],
+                cancel_reason: 0,
             },
         )
     }

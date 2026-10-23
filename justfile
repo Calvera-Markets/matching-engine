@@ -64,7 +64,7 @@ fix *FLAGS:
 sbe *FLAGS:
     cargo run --release --example sbe --features sbe -- {{FLAGS}}
 
-# 10M synthetic tape, WAL on. Pass --no-wal, or --no-wal --codec ouch.
+# 10M synthetic tape. WAL on needs the --wal-* flags; or pass --no-wal (--codec ouch).
 tape *FLAGS:
     cargo run --release --example tape_replay -- --synthetic 10000000 --no-latency {{FLAGS}}
 
@@ -79,3 +79,12 @@ tape-fix *FLAGS:
 # Hot-path bench
 bench *FLAGS:
     cargo bench --bench hot -- {{FLAGS}}
+
+# Journal file-switch bench, one run. Flags: see `scripts/wal_fs_bench.sh`.
+wal-bench *FLAGS:
+    cargo bench --bench wal_switch -- {{FLAGS}}
+
+# Tiny wal_switch run in DIR, checks the harness end to end
+wal-bench-smoke DIR:
+    cargo bench --bench wal_switch -- --dir {{DIR}} --segment-bytes 1048576 --segments 4 --spares 2 --rate 0 --window 64 --prep both --mode threaded --writer wal --poll-us 100 --label smoke --out {{DIR}}/wal_switch.csv
+    test -s {{DIR}}/wal_switch.csv

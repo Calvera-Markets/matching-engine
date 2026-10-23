@@ -1,19 +1,29 @@
 //! Matching engine hot loop: pop Command → WAL → book → push Events.
 
+mod gate;
+
+#[cfg(test)]
+pub(crate) use gate::admit_untracked;
+
 use std::collections::HashMap;
 use std::mem;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use calvera_books::{BookError, OrderBook, OrderHandle, Price, Side, VecConsumer};
 
-use crate::balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
+use gate::EngineGate;
+
+use crate::balance::{BalanceCheck, BalanceOutput, FillCtx, NoCheck, OrderRef, PlaceCtx};
+use crate::cancel_reason;
 use crate::entry::Entry;
+use crate::error::WalError;
+use crate::journal::{Inline, Journal, Verdict};
 use crate::reject;
+use crate::snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventOrder, EventReject, EventTrade};
-use crate::wal::Wal;
+use crate::wal::{Wal, WalConfig};
 
 struct Live {
     handle: OrderHandle,
@@ -25,19 +35,21 @@ struct Live {
     user_ref: u32,
 }
 
-pub struct MatchingEngine<B: BalanceCheck = NoCheck> {
-    cmds: Arc<Spsc<Command>>,
+pub struct MatchingEngine<B: BalanceCheck = NoCheck, J: Journal = Inline> {
+    journal: J,
     ouch: Arc<Spsc<Event>>,
     itch: Arc<Spsc<Event>>,
     book: OrderBook<VecConsumer>,
-    wal: Wal,
     by_client: HashMap<u64, Live>,
     by_handle: HashMap<OrderHandle, u64>,
     next_match: u64,
+    /// Monotonic sequence stamped on balance acks and changes.
+    next_ack: u64,
     publish: bool,
-    wal_enabled: bool,
     slab: usize,
     check: B,
+    /// Makers the check cancelled during the current sweep.
+    uncovered: Vec<OrderHandle>,
 }
 
 impl MatchingEngine<NoCheck> {
@@ -45,21 +57,10 @@ impl MatchingEngine<NoCheck> {
         cmds: Arc<Spsc<Command>>,
         ouch: Arc<Spsc<Event>>,
         itch: Arc<Spsc<Event>>,
-        wal_path: &Path,
+        wal: &WalConfig,
         slab: usize,
-    ) -> std::io::Result<Self> {
-        Self::with_wal_size(cmds, ouch, itch, wal_path, slab, crate::wal::WAL_SIZE)
-    }
-
-    pub fn with_wal_size(
-        cmds: Arc<Spsc<Command>>,
-        ouch: Arc<Spsc<Event>>,
-        itch: Arc<Spsc<Event>>,
-        wal_path: &Path,
-        slab: usize,
-        wal_size: usize,
-    ) -> std::io::Result<Self> {
-        MatchingEngine::with_check(cmds, ouch, itch, wal_path, slab, wal_size, NoCheck)
+    ) -> Result<Self, WalError> {
+        MatchingEngine::with_check(cmds, ouch, itch, wal, slab, NoCheck)
     }
 }
 
@@ -70,59 +71,115 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         cmds: Arc<Spsc<Command>>,
         ouch: Arc<Spsc<Event>>,
         itch: Arc<Spsc<Event>>,
-        wal_path: &Path,
+        wal: &WalConfig,
         slab: usize,
-        wal_size: usize,
         check: B,
-    ) -> std::io::Result<Self> {
+    ) -> Result<Self, WalError> {
+        let mut recovered = Vec::new();
+        let wal = Wal::open(wal, |cmd| recovered.push(cmd))?;
+        Ok(MatchingEngine::with_journal(
+            Inline::new(cmds, wal),
+            recovered,
+            ouch,
+            itch,
+            slab,
+            check,
+        ))
+    }
+
+    /// One engine beat: WAL, then apply. A command the WAL refuses is
+    /// rejected and not applied, so live state never runs ahead of the log.
+    /// Events sit on the rings until `drain_events` (or the egress / ITCH
+    /// threads) pop them.
+    pub fn step(&mut self, cmd: &Command) {
+        let verdict = self.journal.record(cmd);
+        self.settle(cmd, verdict);
+    }
+
+    /// Turn journalling off for throughput measurements. With it off nothing
+    /// is durable and replay cannot rebuild state.
+    pub fn set_wal(&mut self, on: bool) {
+        self.journal.set_enabled(on);
+    }
+
+    pub fn wal(&self) -> &Wal {
+        self.journal.wal()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_mut(&mut self) -> &mut Wal {
+        self.journal.wal_mut()
+    }
+}
+
+impl<B: BalanceCheck, J: Journal> MatchingEngine<B, J> {
+    /// Build an engine on `journal`, first replaying `recovered` (the
+    /// commands the journal's WAL held when it was opened) without publishing.
+    pub fn with_journal(
+        journal: J,
+        recovered: Vec<Command>,
+        ouch: Arc<Spsc<Event>>,
+        itch: Arc<Spsc<Event>>,
+        slab: usize,
+        check: B,
+    ) -> Self {
         let mut engine = Self {
-            cmds,
+            journal,
             ouch,
             itch,
             book: OrderBook::new(slab),
-            wal: Wal::open_sized(wal_path, wal_size)?,
             by_client: HashMap::with_capacity(1 << 20),
             by_handle: HashMap::with_capacity(1 << 20),
             next_match: 1,
+            next_ack: 1,
             publish: false,
-            wal_enabled: true,
             slab,
             check,
+            uncovered: Vec::new(),
         };
-        let mut recovered = Vec::new();
-        engine.wal.recover(|cmd| recovered.push(cmd))?;
         for cmd in recovered {
             engine.apply(&cmd);
         }
         engine.publish = true;
-        Ok(engine)
+        engine
     }
 
     /// Hot loop. Run on a dedicated pinned thread.
     pub fn run(&mut self, running: &AtomicBool) {
         while running.load(Ordering::Relaxed) {
-            let Some(cmd) = self.cmds.pop() else {
+            let Some((cmd, verdict)) = self.journal.next() else {
                 crate::pause();
                 continue;
             };
             if cmd.ty == CommandType::Poison {
                 break;
             }
-            self.step(&cmd);
+            self.settle(&cmd, verdict);
         }
     }
 
-    /// One engine beat: optional WAL, then apply. Events sit on the rings
-    /// until `drain_events` (or the egress / ITCH threads) pop them.
-    pub fn step(&mut self, cmd: &Command) {
-        if self.wal_enabled && cmd.ty != CommandType::Poison {
-            self.wal.write(cmd);
-        }
-        self.apply(cmd);
+    pub fn journal(&self) -> &J {
+        &self.journal
     }
 
-    pub fn set_wal(&mut self, on: bool) {
-        self.wal_enabled = on;
+    #[inline(always)]
+    fn settle(&mut self, cmd: &Command, verdict: Verdict) {
+        match verdict {
+            Verdict::Apply => self.apply(cmd),
+            Verdict::Refuse(reason) => self.refuse(cmd, reason),
+        }
+    }
+
+    /// Answer a command that was not journalled. Entries go back through the
+    /// check, which owns their acks; orders get a reject.
+    fn refuse(&mut self, cmd: &Command, reason: u16) {
+        match cmd.ty {
+            CommandType::Entry => {
+                self.check.refuse_entry(&Entry::from_command(cmd), reason);
+                self.emit_balance_outputs();
+            }
+            _ => self.reject(cmd, reason),
+        }
     }
 
     pub fn check(&self) -> &B {
@@ -133,6 +190,22 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     /// State changes that must survive replay belong in journalled entries.
     pub fn check_mut(&mut self) -> &mut B {
         &mut self.check
+    }
+
+    /// Checkpoint of open orders, match counter, and the balance check.
+    /// Layout: version, match counter, open orders sorted by key, check.
+    pub fn snapshot(&self) -> Snapshot {
+        let mut out = SnapshotSink::new();
+        out.write_u64(SNAPSHOT_VERSION);
+        out.write_u64(self.next_match);
+        let mut keys: Vec<u64> = self.by_client.keys().copied().collect();
+        keys.sort_unstable();
+        out.write_u64(keys.len() as u64);
+        for key in keys {
+            write_live(&mut out, key, &self.by_client[&key]);
+        }
+        self.check.write_snapshot(&mut out);
+        out.finish()
     }
 
     pub fn drain_events(&mut self) -> usize {
@@ -152,7 +225,10 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             CommandType::Cancel => self.cancel(cmd),
             CommandType::Modify => self.modify(cmd),
             CommandType::Reset => self.reset(),
-            CommandType::Entry => self.check.apply_entry(&Entry::from_command(cmd)),
+            CommandType::Entry => {
+                self.check.apply_entry(&Entry::from_command(cmd));
+                self.emit_balance_outputs();
+            }
             CommandType::Poison => {}
         }
     }
@@ -178,15 +254,27 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             return;
         }
 
-        match self.book.add_limit_order(cmd.side, cmd.price, cmd.quantity) {
-            Ok(resting) => {
-                let filled = self.publish_fills(cmd);
-                if let Some(handle) = resting {
-                    let remaining = cmd.quantity.saturating_sub(filled);
+        let mut gate = EngineGate {
+            check: &mut self.check,
+            by_handle: &self.by_handle,
+            by_client: &self.by_client,
+            taker: order,
+            taker_side: cmd.side,
+            uncovered: &mut self.uncovered,
+        };
+        let added = self
+            .book
+            .add_limit_order_gated(cmd.side, cmd.price, cmd.quantity, &mut gate);
+
+        match added {
+            Ok(outcome) => {
+                self.publish_fills(cmd);
+                self.cancel_uncovered_makers();
+                if let Some(handle) = outcome.handle {
                     let live = Live {
                         handle,
                         price: cmd.price,
-                        qty: remaining,
+                        qty: outcome.remaining,
                         side: cmd.side,
                         cl_ord_id: cmd.cl_ord_id,
                         client_fd: cmd.client_fd,
@@ -194,14 +282,19 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                     };
                     self.by_handle.insert(handle, key);
                     self.by_client.insert(key, live);
-                    self.accept(cmd, handle, remaining, b'L');
+                    self.accept(cmd, handle, outcome.remaining, b'L');
                 } else {
                     self.check.on_done(order);
+                    if outcome.stopped {
+                        self.emit_balance_outputs();
+                        self.emit_taker_uncovered(cmd, outcome.remaining);
+                    }
                 }
             }
             Err(err) => {
                 // Matching ran before the rest failed: report those fills too.
                 self.publish_fills(cmd);
+                self.cancel_uncovered_makers();
                 self.check.on_done(order);
                 let reason = match err {
                     BookError::SlabFull => reject::SLAB_FULL,
@@ -210,6 +303,29 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 self.reject(cmd, reason);
             }
         }
+    }
+
+    /// Makers the check vetoed are already off the book; drop them here.
+    fn cancel_uncovered_makers(&mut self) {
+        if self.uncovered.is_empty() {
+            return;
+        }
+        let mut uncovered = mem::take(&mut self.uncovered);
+        for handle in uncovered.drain(..) {
+            let Some(key) = self.by_handle.remove(&handle) else {
+                continue;
+            };
+            let Some(live) = self.by_client.remove(&key) else {
+                continue;
+            };
+            self.check.on_done(OrderRef {
+                client_fd: live.client_fd,
+                user_ref: live.user_ref,
+            });
+            self.emit_balance_outputs();
+            self.emit_cancelled_with(&live, cancel_reason::MAKER_UNCOVERED);
+        }
+        self.uncovered = uncovered;
     }
 
     fn cancel(&mut self, cmd: &Command) {
@@ -223,6 +339,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             client_fd: live.client_fd,
             user_ref: live.user_ref,
         });
+        self.emit_balance_outputs();
         self.emit_cancelled(&live);
     }
 
@@ -240,6 +357,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         self.book = OrderBook::new(self.slab);
         self.check.on_reset();
         self.next_match = 1;
+        // NOTE: ack sequence is not reset; standby comparison uses the snapshot, not ack ids.
         if self.publish {
             self.ouch.push(Event::reset());
         }
@@ -315,6 +433,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
         }
         fills.clear();
         self.book.consumer.fills = fills;
+        self.emit_balance_outputs();
         filled
     }
 
@@ -329,6 +448,7 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 side: cmd.side,
                 order_state: state,
                 cl_ord_id: cmd.cl_ord_id,
+                cancel_reason: 0,
             },
         ));
     }
@@ -347,7 +467,11 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 
     fn emit_cancelled(&mut self, live: &Live) {
-        self.emit(Event::cancelled(
+        self.emit_cancelled_with(live, cancel_reason::NONE);
+    }
+
+    fn emit_cancelled_with(&mut self, live: &Live, reason: u16) {
+        self.emit(Event::cancelled_with_reason(
             live.client_fd,
             EventOrder {
                 order_id: live.handle.as_u64(),
@@ -357,7 +481,27 @@ impl<B: BalanceCheck> MatchingEngine<B> {
                 side: live.side,
                 order_state: b'D',
                 cl_ord_id: live.cl_ord_id,
+                cancel_reason: 0,
             },
+            reason,
+        ));
+    }
+
+    /// The taker never rested; `order_id` 0 marks it as such.
+    fn emit_taker_uncovered(&mut self, cmd: &Command, remaining: u64) {
+        self.emit(Event::cancelled_with_reason(
+            cmd.client_fd,
+            EventOrder {
+                order_id: 0,
+                user_ref: cmd.user_ref,
+                price: cmd.price,
+                quantity: remaining,
+                side: cmd.side,
+                order_state: b'D',
+                cl_ord_id: cmd.cl_ord_id,
+                cancel_reason: 0,
+            },
+            cancel_reason::TAKER_UNCOVERED,
         ));
     }
 
@@ -366,7 +510,10 @@ impl<B: BalanceCheck> MatchingEngine<B> {
             return;
         }
         match evt.ty {
-            crate::types::EventType::OrderRejected | crate::types::EventType::BookReset => {
+            crate::types::EventType::OrderRejected
+            | crate::types::EventType::BookReset
+            | crate::types::EventType::BalanceAck
+            | crate::types::EventType::BalanceChanged => {
                 self.ouch.push(evt);
             }
             _ => {
@@ -377,6 +524,29 @@ impl<B: BalanceCheck> MatchingEngine<B> {
     }
 
     /// Private acks go to both counterparties; the public tape gets one print.
+    fn emit_balance_outputs(&mut self) {
+        if !self.publish {
+            // Replay drains without publishing, but the ack sequence still
+            // advances so numbers consumers already saw are never reissued.
+            self.next_ack += self.check.take_outputs().len() as u64;
+            return;
+        }
+        for out in self.check.take_outputs() {
+            match out {
+                BalanceOutput::Ack(mut ack) => {
+                    ack.engine_seq = self.next_ack;
+                    self.next_ack += 1;
+                    self.ouch.push(Event::balance_ack(ack));
+                }
+                BalanceOutput::Changed(mut ch) => {
+                    ch.engine_seq = self.next_ack;
+                    self.next_ack += 1;
+                    self.ouch.push(Event::balance_changed(ch));
+                }
+            }
+        }
+    }
+
     fn emit_fill(&mut self, taker_fd: i32, maker_fd: i32, trade: EventTrade) {
         if !self.publish {
             return;
@@ -391,14 +561,42 @@ impl<B: BalanceCheck> MatchingEngine<B> {
 }
 
 #[cfg(test)]
+impl<B: BalanceCheck> MatchingEngine<B> {
+    /// Forget a maker the book no longer has, and one the engine never tracked.
+    pub(crate) fn drop_untracked_uncovered(&mut self) -> bool {
+        use calvera_books::SlabIndex;
+        use std::num::NonZeroU32;
+        let generation = NonZeroU32::MIN;
+        let known = OrderHandle::new(Side::Bid, SlabIndex::new(7), generation);
+        let missing = OrderHandle::new(Side::Ask, SlabIndex::new(8), generation);
+        self.by_handle.insert(known, u64::MAX);
+        self.uncovered.push(known);
+        self.uncovered.push(missing);
+        self.cancel_uncovered_makers();
+        self.uncovered.is_empty() && !self.by_handle.contains_key(&known)
+    }
+}
+
+fn write_live(out: &mut SnapshotSink, key: u64, live: &Live) {
+    out.write_u64(key);
+    out.write_u64(live.handle.as_u64());
+    out.write_u64(live.price.0);
+    out.write_u64(live.qty);
+    out.write_u8(live.side as u8);
+    out.write_bytes(&live.cl_ord_id);
+    out.write_i32(live.client_fd);
+    out.write_u32(live.user_ref);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::TempWal;
     use crate::spsc::Spsc;
     use crate::types::{Command, CommandType, Event, EventReject, EventType};
+    use crate::wal::{FRAME, HEADER};
     use calvera_books::{Fill, OrderHandle, Price, Side, SlabIndex};
     use std::num::NonZeroU32;
-    use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::thread;
     use std::time::Duration;
@@ -432,16 +630,99 @@ mod tests {
         let cmds = Arc::new(Spsc::new(64));
         let ouch = Arc::new(Spsc::new(64));
         let itch = Arc::new(Spsc::new(64));
-        let eng = MatchingEngine::with_wal_size(
+        let eng = MatchingEngine::new(
             cmds.clone(),
             ouch.clone(),
             itch.clone(),
-            &wal.0,
+            &wal.config(64 * 1024),
             slab,
-            64 * 1024,
         )
         .unwrap();
         (eng, cmds, ouch, itch)
+    }
+
+    #[test]
+    fn same_log_same_snapshot() {
+        let wal = TempWal::new("snap");
+        let run = |wal: &TempWal| {
+            let (mut eng, _, _, _) = open(wal, 64);
+            eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 10));
+            eng.step(&order(CommandType::Add, 2, 1, Side::Ask, 100, 4));
+            eng.step(&order(CommandType::Add, 1, 2, Side::Bid, 99, 3));
+            eng.snapshot()
+        };
+        let s1 = run(&wal);
+        // Reopen on the same WAL: recovery rebuilds identical state.
+        let (mut eng2, _, _, _) = open(&wal, 64);
+        assert_eq!(eng2.snapshot(), s1);
+        // An independent run of the same tape on a fresh WAL must match.
+        let wal_b = TempWal::new("snap-b");
+        assert_eq!(run(&wal_b), s1);
+        // A different tape gives a different snapshot.
+        eng2.step(&order(CommandType::Cancel, 1, 2, Side::Bid, 0, 0));
+        assert_ne!(eng2.snapshot(), s1);
+    }
+
+    #[test]
+    fn normal_cancel_only_reject_all_normal_and_live_state_matches_replay() {
+        let wal = TempWal::new("full");
+        let open_small = |wal: &TempWal| {
+            let ouch = Arc::new(Spsc::new(256));
+            let mut eng = MatchingEngine::new(
+                Arc::new(Spsc::new(2)),
+                ouch.clone(),
+                Arc::new(Spsc::new(256)),
+                &crate::wal::WalConfig {
+                    reserve_bytes: HEADER + 2 * FRAME,
+                    ..wal.config(HEADER + 4 * FRAME)
+                },
+                64,
+            )
+            .unwrap();
+            eng.wal_mut().hold_spares(true);
+            (eng, ouch)
+        };
+        let live = {
+            let (mut eng, ouch) = open_small(&wal);
+            for user in 0..8 {
+                eng.step(&order(
+                    CommandType::Add,
+                    1,
+                    user,
+                    Side::Bid,
+                    100 - user as u64,
+                    1,
+                ));
+            }
+            let _ = pop_all(&ouch);
+            eng.step(&order(CommandType::Add, 1, 9, Side::Bid, 50, 1));
+            let ev = pop_all(&ouch);
+            assert_eq!(ev.len(), 1);
+            assert_eq!(ev[0].ty, EventType::OrderRejected);
+            assert_eq!(ev[0].reject.reason, reject::JOURNAL_CANCEL_ONLY);
+            eng.step(&order(CommandType::Cancel, 1, 0, Side::Bid, 0, 0));
+            assert_eq!(pop_all(&ouch)[0].ty, EventType::OrderCancelled);
+            eng.step(&order(CommandType::Cancel, 1, 1, Side::Bid, 0, 0));
+            eng.step(&order(CommandType::Cancel, 1, 2, Side::Bid, 0, 0));
+            let ev = pop_all(&ouch);
+            assert_eq!(ev[0].ty, EventType::OrderCancelled);
+            assert_eq!(ev[1].ty, EventType::OrderRejected);
+            assert_eq!(ev[1].reject.reason, reject::JOURNAL_FULL);
+            eng.step(&order(CommandType::Add, 1, 10, Side::Bid, 50, 1));
+            assert_eq!(pop_all(&ouch)[0].reject.reason, reject::JOURNAL_FULL);
+            eng.wal_mut().hold_spares(false);
+            let start = std::time::Instant::now();
+            while eng.wal().stats().spares_ready == 0 {
+                assert!(start.elapsed() < Duration::from_secs(5));
+                thread::sleep(Duration::from_millis(1));
+            }
+            eng.step(&order(CommandType::Add, 1, 11, Side::Bid, 50, 1));
+            assert_eq!(pop_all(&ouch)[0].ty, EventType::OrderAccepted);
+            assert_eq!(eng.wal().mode(), crate::wal::Mode::Normal);
+            eng.snapshot()
+        };
+        let (eng, _) = open_small(&wal);
+        assert_eq!(eng.snapshot(), live);
     }
 
     #[test]
@@ -542,17 +823,17 @@ mod tests {
         let (mut eng, _, ouch, _) = open(&wal, 64);
         eng.set_wal(false);
         eng.step(&order(CommandType::Add, 1, 1, Side::Bid, 100, 1));
-        assert_eq!(eng.wal.bytes_written(), 0);
+        assert_eq!(eng.wal_mut().seq(), 0);
         assert_eq!(ouch.pop().unwrap().ty, EventType::OrderAccepted);
 
         eng.set_wal(true);
         eng.step(&order(CommandType::Add, 1, 2, Side::Ask, 101, 1));
-        assert_eq!(eng.wal.bytes_written(), 64);
+        assert_eq!(eng.wal_mut().seq(), 1);
         let _ = pop_all(&ouch);
 
-        let before = eng.wal.bytes_written();
+        let before = eng.wal_mut().seq();
         eng.step(&Command::poison());
-        assert_eq!(eng.wal.bytes_written(), before);
+        assert_eq!(eng.wal_mut().seq(), before);
         assert!(ouch.pop().is_none());
     }
 
@@ -660,28 +941,43 @@ mod tests {
 
     #[test]
     fn missing_wal_directory_fails() {
-        let err = MatchingEngine::with_wal_size(
+        let mut cfg = TempWal::new("missing").config(4096);
+        cfg.dir = std::path::PathBuf::from("/no/such/me-engine-dir");
+        let err = MatchingEngine::new(
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
-            Path::new("/no/such/me-engine-dir/book.wal"),
+            &cfg,
             64,
-            4096,
         );
-        assert!(err.is_err());
+        assert!(matches!(err, Err(WalError::Config(_))));
     }
 
     #[test]
-    fn new_opens_the_default_wal() {
+    fn new_opens_an_empty_wal() {
         let wal = TempWal::new("new");
         let eng = MatchingEngine::new(
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
             Arc::new(Spsc::new(2)),
-            &wal.0,
+            &wal.config(4096),
             64,
         )
         .unwrap();
-        assert_eq!(eng.wal.bytes_written(), 0);
+        assert_eq!(eng.wal().seq(), 0);
+    }
+
+    #[test]
+    fn check_mut_reaches_the_check() {
+        let wal = TempWal::new("check-mut");
+        let (mut eng, _, _, _) = open(&wal, 8);
+        let _ = eng.check_mut();
+    }
+
+    #[test]
+    fn an_untracked_maker_is_skipped() {
+        let wal = TempWal::new("gate-skip");
+        let (mut eng, _, _, _) = open(&wal, 8);
+        assert!(eng.drop_untracked_uncovered());
     }
 }

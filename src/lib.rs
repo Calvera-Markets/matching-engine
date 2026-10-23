@@ -1,26 +1,35 @@
 //! Matching engine shell around `calvera-books`.
 
 pub mod balance;
+pub mod cancel_reason;
 pub mod codec;
 pub mod egress;
 pub mod engine;
 pub mod entry;
+pub mod error;
 pub mod ingress;
+pub mod journal;
 pub mod md_pub;
 pub mod reject;
+pub mod snapshot;
 pub mod spsc;
 pub mod types;
 pub mod wal;
 
-pub use balance::{BalanceCheck, FillCtx, NoCheck, OrderRef, PlaceCtx};
+pub use balance::{
+    BalanceCheck, BalanceOutput, FillCtx, MatchCtx, NoCheck, OrderRef, PlaceCtx, Verdict,
+};
 #[cfg(feature = "itch")]
 pub use codec::itch;
 #[cfg(feature = "ouch")]
 pub use codec::ouch;
 pub use engine::MatchingEngine;
 pub use entry::Entry;
+pub use error::{GateError, ReplicaError, WalError};
+pub use snapshot::{SNAPSHOT_VERSION, Snapshot, SnapshotSink};
 pub use spsc::Spsc;
-pub use types::{Command, CommandType, Event, EventType};
+pub use types::{Command, CommandType, Event, EventBalanceAck, EventBalanceChanged, EventType};
+pub use wal::{Wal, WalConfig, WalFlags, WalMonitor, WalStats};
 
 #[inline(always)]
 pub fn pause() {
@@ -42,6 +51,7 @@ pub fn lock_memory() {
     let _ = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
 }
 
+/// Temporary WAL directory for tests, removed on drop.
 #[cfg(test)]
 pub(crate) struct TempWal(pub std::path::PathBuf);
 
@@ -52,14 +62,32 @@ impl TempWal {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("me-{label}-{}-{n}.wal", std::process::id()));
+        std::fs::create_dir_all(&path).expect("temp wal dir");
         Self(path)
+    }
+
+    /// A config with blank sparse segments of `segment_bytes`, one spare.
+    pub(crate) fn config(&self, segment_bytes: usize) -> wal::WalConfig {
+        wal::WalConfig {
+            dir: self.0.clone(),
+            epoch: 1,
+            segment_bytes,
+            spares: 1,
+            reserve_bytes: segment_bytes,
+            preallocate: false,
+            prefault: false,
+            retire_queue: 4,
+            seal_sync: false,
+            preparer_poll_us: 100,
+            preparer_cpu: None,
+        }
     }
 }
 
 #[cfg(test)]
 impl Drop for TempWal {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -80,17 +108,16 @@ mod tests {
 
     #[test]
     fn engine_add_then_cancel() {
-        let dir = std::env::temp_dir().join(format!("me-wal-{}.wal", std::process::id()));
+        let wal = TempWal::new("lib-add");
         let cmds = Arc::new(Spsc::new(16));
         let ouch = Arc::new(Spsc::new(16));
         let itch = Arc::new(Spsc::new(16));
-        let mut eng = MatchingEngine::with_wal_size(
+        let mut eng = MatchingEngine::new(
             cmds.clone(),
             ouch.clone(),
             itch.clone(),
-            &dir,
+            &wal.config(64 * 1024),
             1024,
-            64 * 1024,
         )
         .unwrap();
 
@@ -115,23 +142,20 @@ mod tests {
         let ev = ouch.pop().expect("accepted");
         assert_eq!(ev.ty, EventType::OrderAccepted);
         assert_eq!(ev.order.quantity, 10);
-
-        let _ = std::fs::remove_file(dir);
     }
 
     #[test]
     fn fill_acks_maker_and_taker_once_on_tape() {
-        let dir = std::env::temp_dir().join(format!("me-wal-{}-fill.wal", std::process::id()));
+        let wal = TempWal::new("lib-fill");
         let cmds = Arc::new(Spsc::new(16));
         let ouch = Arc::new(Spsc::new(16));
         let itch = Arc::new(Spsc::new(16));
-        let mut eng = MatchingEngine::with_wal_size(
+        let mut eng = MatchingEngine::new(
             cmds.clone(),
             ouch.clone(),
             itch.clone(),
-            &dir,
+            &wal.config(64 * 1024),
             1024,
-            64 * 1024,
         )
         .unwrap();
 
@@ -177,8 +201,6 @@ mod tests {
             .collect();
         assert_eq!(public_trades.len(), 1);
         assert_eq!(public_trades[0].trade.quantity, 10);
-
-        let _ = std::fs::remove_file(dir);
     }
 
     #[test]

@@ -1,0 +1,703 @@
+use std::fs::{self, OpenOptions};
+use std::os::unix::fs::MetadataExt;
+use std::ptr;
+
+use calvera_books::{Price, Side};
+
+use super::frame::{CHAIN_SEED, WalFrame};
+use super::header::SegmentHeader;
+use super::*;
+use crate::TempWal;
+use crate::types::{Command, CommandType};
+
+const PER: usize = 4;
+
+fn small(wal: &TempWal) -> WalConfig {
+    wal.config(HEADER + PER * FRAME)
+}
+
+fn sample(ty: CommandType, side: Side, user: u32) -> Command {
+    let mut cmd = Command::blank(ty);
+    cmd.side = side;
+    cmd.user_ref = user;
+    cmd.price = Price(10 + user as u64);
+    cmd.quantity = 5 + user as u64;
+    cmd.client_fd = 3;
+    cmd.time_in_force = 7;
+    cmd.display = 8;
+    cmd.cl_ord_id = [b'Q'; 14];
+    cmd.capacity = 9;
+    cmd
+}
+
+fn add(user: u32) -> Command {
+    sample(CommandType::Add, Side::Bid, user)
+}
+
+fn open(cfg: &WalConfig) -> Result<(Wal, Vec<Command>), WalError> {
+    let mut got = Vec::new();
+    let w = Wal::open(cfg, |c| got.push(c))?;
+    Ok((w, got))
+}
+
+/// Write once the preparer has every spare ready, so tiny test segments
+/// never outrun it and the log stays in normal mode.
+fn write(w: &mut Wal, cmd: &Command) {
+    let want = w.spares_wanted();
+    assert!(wait_for(|| w.stats().spares_ready == want));
+    w.write(cmd).unwrap();
+    assert_eq!(w.mode(), Mode::Normal);
+}
+
+fn write_n(cfg: &WalConfig, n: u32) {
+    let (mut w, _) = open(cfg).unwrap();
+    for user in 0..n {
+        write(&mut w, &add(user));
+    }
+}
+
+/// Activated segment files, ordered by header index.
+fn segments(cfg: &WalConfig) -> Vec<(std::path::PathBuf, SegmentHeader)> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(&cfg.dir).unwrap() {
+        let path = e.unwrap().path();
+        let bytes = fs::read(&path).unwrap();
+        let h = unsafe { ptr::read_unaligned(bytes.as_ptr() as *const SegmentHeader) };
+        if bytes[..HEADER].iter().any(|&b| b != 0) {
+            out.push((path, h));
+        }
+    }
+    out.sort_by_key(|(_, h)| h.index);
+    out
+}
+
+fn poke(path: &std::path::Path, at: usize, f: impl FnOnce(&mut [u8])) {
+    let mut bytes = fs::read(path).unwrap();
+    f(&mut bytes[at..]);
+    fs::write(path, bytes).unwrap();
+}
+
+fn reframe(path: &std::path::Path, slot: usize, prev: u32, f: impl FnOnce(&mut WalFrame)) {
+    poke(path, HEADER + slot * FRAME, |b| {
+        let mut frame = unsafe { ptr::read_unaligned(b.as_ptr() as *const WalFrame) };
+        f(&mut frame);
+        frame.checksum = frame.chained(prev);
+        unsafe { ptr::write_unaligned(b.as_mut_ptr() as *mut WalFrame, frame) };
+    });
+}
+
+fn checksum_at(path: &std::path::Path, slot: usize) -> u32 {
+    let bytes = fs::read(path).unwrap();
+    let frame =
+        unsafe { ptr::read_unaligned(bytes[HEADER + slot * FRAME..].as_ptr() as *const WalFrame) };
+    frame.checksum
+}
+
+#[test]
+fn round_trips_every_command_field() {
+    let wal = TempWal::new("seg-roundtrip");
+    let cfg = small(&wal);
+    let written = [
+        sample(CommandType::Add, Side::Bid, 0),
+        sample(CommandType::Modify, Side::Ask, 1),
+        sample(CommandType::Cancel, Side::Bid, 2),
+        sample(CommandType::Reset, Side::Ask, 3),
+        sample(CommandType::Poison, Side::Bid, 4),
+        sample(CommandType::Entry, Side::Bid, 5),
+    ];
+    {
+        let (mut w, got) = open(&cfg).unwrap();
+        assert!(got.is_empty());
+        for cmd in &written {
+            write(&mut w, cmd);
+        }
+        assert_eq!(w.seq(), 6);
+    }
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), written.len());
+    for (got, want) in got.iter().zip(written.iter()) {
+        assert_eq!(got.ty, want.ty);
+        assert_eq!(got.side, want.side);
+        assert_eq!(got.user_ref, want.user_ref);
+        assert_eq!(got.price, want.price);
+        assert_eq!(got.quantity, want.quantity);
+        assert_eq!(got.client_fd, want.client_fd);
+        assert_eq!(got.time_in_force, want.time_in_force);
+        assert_eq!(got.display, want.display);
+        assert_eq!(got.cl_ord_id, want.cl_ord_id);
+        assert_eq!(got.capacity, 0);
+    }
+}
+
+#[test]
+fn rolls_across_many_segments_and_resumes_where_it_stopped() {
+    let wal = TempWal::new("seg-many");
+    let cfg = small(&wal);
+    write_n(&cfg, (PER * 5 + 2) as u32);
+    let segs = segments(&cfg);
+    assert_eq!(segs.len(), 6);
+    for (i, (_, h)) in segs.iter().enumerate() {
+        assert_eq!(h.index, i as u64);
+        assert_eq!(h.first_seq, (i * PER) as u64 + 1);
+        assert_eq!(h.epoch, cfg.epoch);
+    }
+    assert_eq!(segs[0].1.prev, CHAIN_SEED);
+    assert_eq!(segs[1].1.prev, checksum_at(&segs[0].0, PER - 1));
+
+    let (mut w, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 5 + 2);
+    assert!(got.iter().enumerate().all(|(i, c)| c.user_ref == i as u32));
+    assert_eq!(w.segment(), 5);
+    write(&mut w, &add(99));
+    write(&mut w, &add(100));
+    write(&mut w, &add(101));
+    assert_eq!(w.segment(), 6);
+    drop(w);
+    let (w, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 5 + 5);
+    assert_eq!(got.last().unwrap().user_ref, 101);
+    assert_eq!(w.seq(), (PER * 5 + 5) as u64);
+}
+
+#[test]
+fn blank_spares_are_removed_on_open() {
+    let wal = TempWal::new("seg-blank");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let files = || fs::read_dir(&cfg.dir).unwrap().count();
+    // Active segment, one spare, one reserve.
+    assert_eq!(files(), 3);
+    let (w, _) = open(&cfg).unwrap();
+    assert_eq!(files(), 3);
+    assert_eq!(w.stats().spares_ready, 1);
+}
+
+#[test]
+fn a_torn_last_frame_is_dropped() {
+    let wal = TempWal::new("seg-torn");
+    let cfg = small(&wal);
+    write_n(&cfg, PER as u32 + 2);
+    let segs = segments(&cfg);
+    poke(&segs[1].0, HEADER + FRAME + 20, |b| b[0] ^= 0xFF);
+    let (mut w, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER + 1);
+    write(&mut w, &add(77));
+    drop(w);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER + 2);
+    assert_eq!(got.last().unwrap().user_ref, 77);
+}
+
+#[test]
+fn a_bad_frame_before_the_tail_is_an_error() {
+    let wal = TempWal::new("seg-mid");
+    let cfg = small(&wal);
+    write_n(&cfg, 3);
+    let segs = segments(&cfg);
+    poke(&segs[0].0, HEADER + FRAME + 20, |b| b[0] ^= 0xFF);
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::Corrupt { segment: 0, offset }) if offset == HEADER + FRAME
+    ));
+}
+
+#[test]
+fn a_bad_frame_in_an_earlier_segment_is_an_error_even_at_its_end() {
+    let wal = TempWal::new("seg-earlier");
+    let cfg = small(&wal);
+    write_n(&cfg, PER as u32 + 1);
+    let segs = segments(&cfg);
+    poke(&segs[0].0, HEADER + (PER - 1) * FRAME + 20, |b| {
+        b[0] ^= 0xFF
+    });
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::Corrupt { segment: 0, .. })
+    ));
+}
+
+#[test]
+fn a_zeroed_frame_with_data_after_it_is_an_error() {
+    let wal = TempWal::new("seg-hole");
+    let cfg = small(&wal);
+    write_n(&cfg, 3);
+    let segs = segments(&cfg);
+    poke(&segs[0].0, HEADER + FRAME, |b| b[..FRAME].fill(0));
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::Corrupt { segment: 0, .. })
+    ));
+}
+
+#[test]
+fn a_sequence_gap_is_an_error() {
+    let wal = TempWal::new("seg-gap");
+    let cfg = small(&wal);
+    write_n(&cfg, 2);
+    let segs = segments(&cfg);
+    let prev = checksum_at(&segs[0].0, 0);
+    reframe(&segs[0].0, 1, prev, |f| f.seq = 7);
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::Gap {
+            expected: 2,
+            found: 7
+        })
+    ));
+}
+
+#[test]
+fn a_frame_from_another_layout_version_is_refused() {
+    let wal = TempWal::new("seg-version");
+    let cfg = small(&wal);
+    write_n(&cfg, 2);
+    let segs = segments(&cfg);
+    let prev = checksum_at(&segs[0].0, 0);
+    reframe(&segs[0].0, 1, prev, |f| {
+        f.version = WAL_VERSION.wrapping_add(1)
+    });
+    assert!(matches!(open(&cfg), Err(WalError::Version { seq: 2, .. })));
+}
+
+#[test]
+fn a_missing_segment_is_an_error() {
+    let wal = TempWal::new("seg-missing");
+    let cfg = small(&wal);
+    write_n(&cfg, (PER * 2 + 1) as u32);
+    let segs = segments(&cfg);
+    fs::remove_file(&segs[1].0).unwrap();
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::MissingSegment {
+            expected: 1,
+            found: 2
+        })
+    ));
+}
+
+#[test]
+fn a_broken_chain_is_an_error() {
+    let wal = TempWal::new("seg-chain");
+    let cfg = small(&wal);
+    write_n(&cfg, PER as u32 + 1);
+    let segs = segments(&cfg);
+    let h = segs[1].1;
+    let forged = SegmentHeader::new(h.epoch, h.index, h.first_seq, h.prev ^ 1);
+    poke(&segs[1].0, 0, |b| unsafe {
+        ptr::write_unaligned(b.as_mut_ptr() as *mut SegmentHeader, forged)
+    });
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::BrokenChain { index: 1 })
+    ));
+}
+
+#[test]
+fn a_segment_from_another_epoch_is_refused() {
+    let wal = TempWal::new("seg-epoch");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let mut other = cfg.clone();
+    other.epoch = cfg.epoch + 1;
+    assert!(matches!(
+        open(&other),
+        Err(WalError::StaleEpoch {
+            index: 0,
+            found: 1,
+            expected: 2
+        })
+    ));
+}
+
+#[test]
+fn a_corrupt_header_with_frames_is_an_error() {
+    let wal = TempWal::new("seg-header");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let segs = segments(&cfg);
+    poke(&segs[0].0, 20, |b| b[0] ^= 0xFF);
+    assert!(matches!(open(&cfg), Err(WalError::BadHeader { .. })));
+}
+
+#[test]
+fn full_when_no_spare_is_ready_and_nothing_is_written() {
+    let wal = TempWal::new("seg-full");
+    let cfg = small(&wal);
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 2) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    assert!(matches!(w.write(&add(50)), Err(WalError::CancelOnly)));
+    assert_eq!(w.seq(), (PER * 2) as u64);
+    w.hold_spares(false);
+    write(&mut w, &add(51));
+    drop(w);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 2 + 1);
+    assert_eq!(got.last().unwrap().user_ref, 51);
+}
+
+#[test]
+fn bad_config_is_refused() {
+    let wal = TempWal::new("seg-cfg");
+    let mut cfg = wal.config(HEADER);
+    assert!(matches!(open(&cfg), Err(WalError::Config(_))));
+    cfg.segment_bytes = HEADER + FRAME;
+    cfg.reserve_bytes = HEADER + FRAME;
+    cfg.spares = 0;
+    assert!(matches!(open(&cfg), Err(ref err) if err.to_string().contains("spares")));
+    cfg.spares = 1;
+    cfg.retire_queue = 0;
+    assert!(matches!(
+        open(&cfg),
+        Err(ref err) if err.to_string().contains("retire_queue")
+    ));
+    cfg.retire_queue = 1;
+    cfg.dir = cfg.dir.join("nope");
+    assert!(matches!(open(&cfg), Err(WalError::Config(_))));
+}
+
+#[test]
+fn reserve_blocks_allocates_the_file() {
+    let wal = TempWal::new("reserve-blocks");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(wal.0.join("one"))
+        .unwrap();
+    let len = 256 * 1024;
+    reserve_blocks(&file, len).unwrap();
+    let meta = file.metadata().unwrap();
+    assert_eq!(meta.len(), len);
+    assert!(
+        meta.blocks() * 512 >= len,
+        "reserved {} bytes for a {len}-byte file",
+        meta.blocks() * 512
+    );
+}
+
+#[test]
+fn preallocated_and_prefaulted_segments_work() {
+    let wal = TempWal::new("seg-prep");
+    let mut cfg = small(&wal);
+    cfg.preallocate = true;
+    cfg.prefault = true;
+    write_n(&cfg, PER as u32 * 2);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 2);
+}
+
+#[test]
+fn flags_build_a_config_and_report_what_is_missing() {
+    let mut flags = WalFlags::new();
+    for (f, v) in [
+        ("--wal-dir", "/tmp"),
+        ("--wal-epoch", "3"),
+        ("--wal-segment-bytes", "1_048_576"),
+        ("--wal-spares", "2"),
+        ("--wal-reserve-bytes", "65536"),
+        ("--wal-preallocate", "on"),
+    ] {
+        assert!(WalFlags::owns(f));
+        flags.set(f, v).unwrap();
+    }
+    assert!(flags.set("--wal-prefault", "maybe").is_err());
+    assert!(!WalFlags::owns("--port"));
+    let mut partial = WalFlags::new();
+    partial.set("--wal-dir", "/tmp").unwrap();
+    assert!(matches!(partial.build(), Err(WalError::Config(m)) if m.contains("--wal-epoch")));
+    flags.set("--wal-prefault", "off").unwrap();
+    assert!(
+        matches!(flags.clone().build(), Err(WalError::Config(m)) if m.contains("--wal-retire-queue"))
+    );
+    flags.set("--wal-retire-queue", "8").unwrap();
+    flags.set("--wal-seal-sync", "on").unwrap();
+    flags.set("--wal-preparer-poll-us", "50").unwrap();
+    flags.set("--wal-preparer-cpu", "none").unwrap();
+    assert_eq!(flags.clone().build().unwrap().preparer_cpu, None);
+    flags.set("--wal-preparer-cpu", "2").unwrap();
+    let cfg = flags.build().unwrap();
+    assert_eq!(cfg.preparer_cpu, Some(2));
+    assert!(WalFlags::default().build().is_err());
+    assert!(WalFlags::new().set("--wal-nope", "1").is_err());
+    assert!(matches!(
+        WalFlags::new().set("--wal-segment-bytes", "nope"),
+        Err(WalError::Config(m)) if m.contains("wal-segment-bytes")
+    ));
+    assert!(cfg.seal_sync);
+    assert_eq!(cfg.segment_bytes, 1 << 20);
+    assert_eq!(cfg.epoch, 3);
+    assert!(cfg.preallocate && !cfg.prefault);
+}
+
+#[test]
+fn the_preparer_keeps_spares_ready_and_seals_full_segments() {
+    let wal = TempWal::new("seg-prep-thread");
+    let mut cfg = small(&wal);
+    cfg.spares = 3;
+    cfg.seal_sync = true;
+    cfg.retire_queue = 32;
+    let (mut w, _) = open(&cfg).unwrap();
+    assert_eq!(w.stats().spares_ready, 3);
+    for user in 0..(PER * 20) as u32 {
+        write(&mut w, &add(user));
+    }
+    let settled = wait_for(|| {
+        let s = w.stats();
+        s.spares_ready == 3 && s.sealed == 19
+    });
+    assert!(settled, "{:?}", w.stats());
+    let s = w.stats();
+    assert_eq!(s.prepare_failures, 0);
+    assert_eq!(s.seal_failures, 0);
+    assert_eq!(s.inline_retires, 0);
+    assert_eq!(s.rolls, 19);
+    drop(w);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 20);
+}
+
+#[test]
+fn a_held_preparer_runs_the_log_out_of_spares_and_recovers() {
+    let wal = TempWal::new("seg-prep-held");
+    let mut cfg = small(&wal);
+    cfg.spares = 2;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 3) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    assert!(matches!(w.write(&add(99)), Err(WalError::CancelOnly)));
+    let s = w.stats();
+    assert_eq!(s.spares_ready, 0);
+    assert_eq!(s.no_spare, 1);
+    w.hold_spares(false);
+    assert!(wait_for(|| w.stats().spares_ready == 2));
+    write(&mut w, &add(100));
+    assert_eq!(w.seq(), (PER * 3 + 1) as u64);
+}
+
+#[test]
+fn a_monitor_reads_counters_from_another_thread() {
+    let wal = TempWal::new("seg-monitor");
+    let cfg = small(&wal);
+    let (mut w, _) = open(&cfg).unwrap();
+    let monitor = w.monitor();
+    for user in 0..(PER + 1) as u32 {
+        write(&mut w, &add(user));
+    }
+    let seen = std::thread::spawn(move || wait_for(|| monitor.stats().sealed == 1));
+    assert!(seen.join().unwrap());
+}
+
+fn wait_for(mut ok: impl FnMut() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
+fn cancel(user: u32) -> Command {
+    sample(CommandType::Cancel, Side::Bid, user)
+}
+
+#[test]
+fn no_spare_falls_back_to_cancel_only_then_reject_all_then_recovers() {
+    let wal = TempWal::new("seg-degraded");
+    let mut cfg = small(&wal);
+    cfg.reserve_bytes = HEADER + 2 * FRAME;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 2) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    assert_eq!(w.mode(), Mode::Normal);
+
+    assert!(matches!(w.write(&add(50)), Err(WalError::CancelOnly)));
+    assert_eq!(w.mode(), Mode::CancelOnly);
+    assert!(matches!(
+        w.write(
+            &crate::entry::Entry {
+                kind: 2,
+                tag: 0,
+                channel: 1,
+                words: [0; 4]
+            }
+            .to_command()
+        ),
+        Err(WalError::CancelOnly)
+    ));
+    assert!(matches!(
+        w.write(&sample(CommandType::Modify, Side::Bid, 1)),
+        Err(WalError::CancelOnly)
+    ));
+    w.write(&cancel(0)).unwrap();
+    w.write(&cancel(1)).unwrap();
+    assert!(matches!(w.write(&cancel(2)), Err(WalError::Full)));
+    assert_eq!(w.mode(), Mode::RejectAll);
+    assert!(matches!(w.write(&add(51)), Err(WalError::Full)));
+    let seq = w.seq();
+    assert_eq!(seq, (PER * 2 + 2) as u64);
+    let s = w.stats();
+    assert_eq!(s.mode, Mode::RejectAll);
+    assert_eq!(s.reserves_used, 1);
+    assert_eq!(s.mode_changes, 2);
+
+    w.hold_spares(false);
+    assert!(wait_for(|| w.stats().spares_ready == 1));
+    w.write(&add(52)).unwrap();
+    assert_eq!(w.mode(), Mode::Normal);
+    assert_eq!(w.stats().mode, Mode::Normal);
+    drop(w);
+
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 2 + 3);
+    assert_eq!(got[PER * 2].ty, CommandType::Cancel);
+    assert_eq!(got[PER * 2 + 1].ty, CommandType::Cancel);
+    assert_eq!(got.last().unwrap().user_ref, 52);
+}
+
+#[test]
+fn a_spare_ends_cancel_only_before_the_reserve_fills() {
+    let wal = TempWal::new("seg-reserve-early");
+    let mut cfg = small(&wal);
+    cfg.reserve_bytes = HEADER + 8 * FRAME;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER * 2) as u32 {
+        w.write(&add(user)).unwrap();
+    }
+    w.write(&cancel(0)).unwrap();
+    assert_eq!(w.mode(), Mode::CancelOnly);
+    w.hold_spares(false);
+    assert!(wait_for(|| w.stats().spares_ready == 1));
+    w.write(&add(60)).unwrap();
+    assert_eq!(w.mode(), Mode::Normal);
+    for user in 61..(61 + PER as u32) {
+        write(&mut w, &add(user));
+    }
+    drop(w);
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), PER * 2 + 2 + PER);
+}
+
+#[test]
+fn reserve_size_is_validated() {
+    let wal = TempWal::new("seg-reserve-cfg");
+    let mut cfg = small(&wal);
+    cfg.reserve_bytes = FRAME;
+    assert!(matches!(open(&cfg), Err(WalError::Config(_))));
+}
+
+#[test]
+fn files_that_are_not_segments_are_ignored() {
+    let wal = TempWal::new("seg-stray");
+    let cfg = small(&wal);
+    write_n(&cfg, 2);
+    fs::write(cfg.dir.join("notes.txt"), b"nope").unwrap();
+    let (_, got) = open(&cfg).unwrap();
+    assert_eq!(got.len(), 2);
+}
+
+#[test]
+fn a_short_file_is_not_a_segment() {
+    let wal = TempWal::new("seg-short");
+    let path = wal.0.join(super::segment::Segment::file_name(0));
+    fs::write(&path, [0u8; 8]).unwrap();
+    assert!(matches!(
+        super::segment::Segment::open(&path),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput
+    ));
+}
+
+#[test]
+fn a_header_from_another_version_is_refused() {
+    let wal = TempWal::new("seg-ver");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let segs = segments(&cfg);
+    poke(&segs[0].0, 0, |b| {
+        b[8] = 9;
+        let sum = super::frame::fnv(CHAIN_SEED, &b[8..HEADER]);
+        b[4..8].copy_from_slice(&sum.to_ne_bytes());
+    });
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::SegmentVersion { found: 9 })
+    ));
+}
+
+#[test]
+fn a_segment_that_skips_a_sequence_is_refused() {
+    let wal = TempWal::new("seg-gap");
+    let cfg = small(&wal);
+    write_n(&cfg, 1);
+    let segs = segments(&cfg);
+    let h = segs[0].1;
+    let forged = SegmentHeader::new(h.epoch, h.index, h.first_seq + 3, h.prev);
+    poke(&segs[0].0, 0, |b| unsafe {
+        ptr::write_unaligned(b.as_mut_ptr() as *mut SegmentHeader, forged)
+    });
+    assert!(matches!(
+        open(&cfg),
+        Err(WalError::Gap {
+            expected: 1,
+            found: 4
+        })
+    ));
+}
+
+#[test]
+fn reserve_blocks_reports_a_file_it_cannot_allocate() {
+    let wal = TempWal::new("reserve-ro");
+    let path = wal.0.join("ro");
+    fs::write(&path, b"").unwrap();
+    let file = OpenOptions::new().read(true).open(&path).unwrap();
+    assert!(reserve_blocks(&file, 4096).is_err());
+}
+
+#[test]
+fn the_preparer_can_be_pinned() {
+    let wal = TempWal::new("seg-cpu");
+    let mut cfg = small(&wal);
+    cfg.preparer_cpu = Some(0);
+    let (mut w, _) = open(&cfg).unwrap();
+    write(&mut w, &add(1));
+    assert_eq!(w.seq(), 1);
+}
+
+#[test]
+fn a_preparer_that_cannot_create_a_segment_counts_the_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let wal = TempWal::new("seg-prep-fail");
+    let mut cfg = small(&wal);
+    cfg.preparer_poll_us = 1_000;
+    let (mut w, _) = open(&cfg).unwrap();
+    w.hold_spares(true);
+    for user in 0..(PER as u32 + 1) {
+        write(&mut w, &add(user));
+    }
+    fs::set_permissions(&cfg.dir, fs::Permissions::from_mode(0o555)).unwrap();
+    w.hold_spares(false);
+    let start = Instant::now();
+    let failed = loop {
+        if w.stats().prepare_failures > 0 {
+            break true;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    fs::set_permissions(&cfg.dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(failed);
+}

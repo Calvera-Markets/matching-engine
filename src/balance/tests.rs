@@ -9,6 +9,7 @@ use crate::entry::Entry;
 use crate::reject;
 use crate::spsc::Spsc;
 use crate::types::{Command, CommandType, Event, EventType};
+use crate::wal::{FRAME, HEADER};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Call {
@@ -16,6 +17,7 @@ enum Call {
     Fill(FillCtx),
     Done(OrderRef),
     Entry(Entry),
+    Refused(Entry, u16),
     Reset,
 }
 
@@ -24,6 +26,7 @@ enum Call {
 struct Recorder {
     max_qty: u64,
     calls: Vec<Call>,
+    pending: Vec<crate::balance::BalanceOutput>,
 }
 
 impl BalanceCheck for Recorder {
@@ -47,6 +50,28 @@ impl BalanceCheck for Recorder {
 
     fn apply_entry(&mut self, entry: &Entry) {
         self.calls.push(Call::Entry(*entry));
+        self.pending.push(crate::balance::BalanceOutput::Ack(
+            crate::types::EventBalanceAck {
+                channel: entry.channel,
+                seq: entry.words[3],
+                engine_seq: 0,
+                kind: 0,
+                reason: 0,
+            },
+        ));
+    }
+
+    fn refuse_entry(&mut self, entry: &Entry, reason: u16) {
+        self.calls.push(Call::Refused(*entry, reason));
+        self.pending.push(crate::balance::BalanceOutput::Ack(
+            crate::types::EventBalanceAck {
+                channel: entry.channel,
+                seq: entry.words[3],
+                engine_seq: 0,
+                kind: 0,
+                reason,
+            },
+        ));
     }
 
     fn on_reset(&mut self) {
@@ -56,22 +81,34 @@ impl BalanceCheck for Recorder {
     fn reject_code(err: u8) -> u8 {
         err
     }
+
+    fn write_snapshot(&self, out: &mut crate::snapshot::SnapshotSink) {
+        out.write_u64(self.max_qty);
+    }
+
+    fn take_outputs(&mut self) -> Vec<crate::balance::BalanceOutput> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
 type Rig = (MatchingEngine<Recorder>, Arc<Spsc<Event>>);
 
 fn open(wal: &TempWal, slab: usize, max_qty: u64) -> Rig {
+    open_sized(wal, slab, max_qty, 64 * 1024)
+}
+
+fn open_sized(wal: &TempWal, slab: usize, max_qty: u64, wal_bytes: usize) -> Rig {
     let ouch = Arc::new(Spsc::new(256));
     let eng = MatchingEngine::with_check(
         Arc::new(Spsc::new(8)),
         ouch.clone(),
         Arc::new(Spsc::new(256)),
-        &wal.0,
+        &wal.config(wal_bytes),
         slab,
-        64 * 1024,
         Recorder {
             max_qty,
             calls: Vec::new(),
+            pending: Vec::new(),
         },
     )
     .unwrap();
@@ -101,6 +138,85 @@ fn drain(q: &Spsc<Event>) -> Vec<Event> {
         out.push(e);
     }
     out
+}
+
+#[test]
+fn default_hooks_admit_and_ignore_a_refusal() {
+    use super::{BalanceCheck, MatchCtx, NoCheck, Verdict};
+    use calvera_books::{Price, Side};
+
+    let ctx = MatchCtx {
+        taker: order(1, 1),
+        taker_side: Side::Bid,
+        maker: order(2, 2),
+        price: Price(10),
+        quantity: 1,
+    };
+    let entry = Entry {
+        kind: 0,
+        tag: 0,
+        channel: 0,
+        words: [0; 4],
+    };
+    let mut bare = NoCheck;
+    assert_eq!(bare.admit(&ctx), Verdict::Fill);
+    bare.apply_entry(&entry);
+    bare.refuse_entry(&entry, 1);
+    assert!(bare.take_outputs().is_empty());
+
+    struct Defaults;
+    impl BalanceCheck for Defaults {
+        type Error = ();
+        fn on_place(&mut self, _: &super::PlaceCtx) -> Result<(), ()> {
+            Ok(())
+        }
+        fn on_fill(&mut self, _: &FillCtx) {}
+        fn on_done(&mut self, _: OrderRef) {}
+        fn apply_entry(&mut self, _: &Entry) {}
+        fn on_reset(&mut self) {}
+        fn reject_code(_: ()) -> u8 {
+            0
+        }
+        fn write_snapshot(&self, _: &mut crate::snapshot::SnapshotSink) {}
+    }
+    let mut defaults = Defaults;
+    assert_eq!(defaults.admit(&ctx), Verdict::Fill);
+    defaults.refuse_entry(&entry, 4);
+    assert!(defaults.take_outputs().is_empty());
+}
+
+#[test]
+fn a_balance_change_is_sequenced_on_the_private_ring() {
+    use super::BalanceOutput;
+    use crate::types::EventBalanceChanged;
+
+    let wal = TempWal::new("changed");
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    eng.check_mut()
+        .pending
+        .push(BalanceOutput::Changed(EventBalanceChanged {
+            account: 7,
+            asset: 1,
+            balance: 40,
+            locked: 5,
+            engine_seq: 0,
+        }));
+    eng.step(
+        &Entry {
+            kind: 1,
+            tag: 0,
+            channel: 1,
+            words: [0; 4],
+        }
+        .to_command(),
+    );
+    let changed = drain(&ouch)
+        .into_iter()
+        .find(|e| e.ty == EventType::BalanceChanged)
+        .unwrap();
+    assert_eq!(changed.balance_changed.account, 7);
+    assert_eq!(changed.balance_changed.engine_seq, 1);
+    assert_eq!(changed.balance_changed.balance, 40);
 }
 
 #[test]
@@ -202,4 +318,116 @@ fn entries_are_journalled_and_replayed_through_the_check() {
     assert_eq!(live.last(), Some(&Call::Reset));
     let (eng, _) = open(&wal, 64, 100);
     assert_eq!(eng.check().calls, live);
+}
+
+#[test]
+fn cancel_reason_constants_are_stable() {
+    assert_eq!(crate::cancel_reason::NONE, 0);
+    assert_eq!(crate::cancel_reason::MAKER_UNCOVERED, 0x0200);
+    assert_eq!(crate::cancel_reason::TAKER_UNCOVERED, 0x0201);
+}
+
+#[test]
+fn entry_emits_a_balance_ack_on_the_private_ring() {
+    let wal = TempWal::new("ack");
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    let entry = Entry {
+        kind: 1,
+        tag: 0,
+        channel: 9,
+        words: [0, 0, 0, 1],
+    };
+    eng.step(&entry.to_command());
+    let evs: Vec<_> = std::iter::from_fn(|| ouch.pop()).collect();
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0].ty, EventType::BalanceAck);
+    assert_eq!(evs[0].balance_ack.channel, 9);
+    assert_eq!(evs[0].balance_ack.seq, 1);
+    assert_eq!(evs[0].balance_ack.engine_seq, 1);
+}
+
+fn entry(seq: u64) -> Entry {
+    Entry {
+        kind: 1,
+        tag: 0,
+        channel: 9,
+        words: [0, 0, 0, seq],
+    }
+}
+
+fn acks(q: &Spsc<Event>) -> Vec<u64> {
+    drain(q)
+        .iter()
+        .filter(|e| e.ty == EventType::BalanceAck)
+        .map(|e| e.balance_ack.engine_seq)
+        .collect()
+}
+
+#[test]
+fn ack_sequence_continues_after_a_restart() {
+    let wal = TempWal::new("ack-restart");
+    {
+        let (mut eng, ouch) = open(&wal, 64, 100);
+        eng.step(&entry(1).to_command());
+        eng.step(&entry(2).to_command());
+        assert_eq!(acks(&ouch), vec![1, 2]);
+    }
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    assert!(drain(&ouch).is_empty());
+    eng.step(&entry(3).to_command());
+    assert_eq!(acks(&ouch), vec![3]);
+}
+
+#[test]
+fn an_entry_the_log_refuses_is_reported_and_not_applied() {
+    let wal = TempWal::new("ack-full");
+    let (mut eng, ouch) = open_sized(&wal, 64, 100, HEADER + FRAME);
+    eng.wal_mut().hold_spares(true);
+    eng.step(&entry(1).to_command());
+    eng.step(&entry(2).to_command());
+    eng.step(&entry(3).to_command());
+    let ev = drain(&ouch);
+    assert_eq!(ev.len(), 3);
+    assert_eq!(ev[2].balance_ack.reason, reject::JOURNAL_CANCEL_ONLY);
+    assert_eq!(ev[2].balance_ack.seq, 3);
+    let calls = &eng.check().calls;
+    assert_eq!(
+        calls[2],
+        Call::Refused(entry(3), reject::JOURNAL_CANCEL_ONLY)
+    );
+    assert_eq!(
+        calls.iter().filter(|c| matches!(c, Call::Entry(_))).count(),
+        2
+    );
+    eng.step(&add(1, 1, Side::Bid, 100, 1));
+    let ev = drain(&ouch);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].ty, EventType::OrderRejected);
+    assert_eq!(ev[0].reject.reason, reject::JOURNAL_CANCEL_ONLY);
+}
+
+#[test]
+fn modify_and_poison_are_applied() {
+    let wal = TempWal::new("check-mod");
+    let (mut eng, ouch) = open(&wal, 64, 100);
+    eng.step(&add(1, 1, Side::Bid, 100, 4));
+    let mut modify = Command::blank(CommandType::Modify);
+    modify.client_fd = 1;
+    modify.user_ref = 1;
+    modify.side = Side::Ask;
+    modify.price = Price(110);
+    modify.quantity = 2;
+    eng.step(&modify);
+    eng.step(&Command::poison());
+    let ev = drain(&ouch);
+    assert!(
+        ev.iter()
+            .any(|e| e.ty == EventType::OrderAccepted && e.order.side == Side::Ask)
+    );
+    assert!(
+        eng.check()
+            .calls
+            .iter()
+            .any(|c| matches!(c, Call::Place(_)))
+    );
 }

@@ -21,6 +21,8 @@ use matching_engine::codec::{ParseOutcome, SessionId};
 use matching_engine::engine::MatchingEngine;
 use matching_engine::spsc::Spsc;
 use matching_engine::types::{Command, CommandType, Event};
+use matching_engine::wal::{FLAGS_USAGE, FRAME, HEADER};
+use matching_engine::{WalConfig, WalFlags};
 
 #[derive(Clone, Copy)]
 enum Action {
@@ -246,7 +248,7 @@ fn parse_args() -> (
     Option<usize>,
     usize,
     usize,
-    bool,
+    Option<WalFlags>,
     bool,
     Codec,
 ) {
@@ -254,7 +256,7 @@ fn parse_args() -> (
     let mut synthetic = None;
     let mut slab = 200_000usize;
     let mut warmup = 100_000usize;
-    let mut wal = true;
+    let mut wal = Some(WalFlags::new());
     let mut latency = true;
     let mut codec = Codec::None;
     let mut args = std::env::args().skip(1);
@@ -265,13 +267,22 @@ fn parse_args() -> (
             "--synthetic" => synthetic = Some(take().replace('_', "").parse().unwrap()),
             "--slab" => slab = take().replace('_', "").parse().unwrap(),
             "--warmup" => warmup = take().parse().unwrap(),
-            "--no-wal" => wal = false,
+            "--no-wal" => wal = None,
+            flag if WalFlags::owns(flag) => {
+                let v = take();
+                if let Some(w) = wal.as_mut()
+                    && let Err(e) = w.set(flag, &v)
+                {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
             "--no-latency" => latency = false,
             "--codec" => codec = parse_codec(&take()),
             "-h" | "--help" => {
                 eprintln!(
                     "tape_replay --synthetic N | --tape FILE [--slab N] [--warmup N]\n\
-                     [--no-wal] [--no-latency] [--codec none|ouch|fix|sbe]"
+                     ({FLAGS_USAGE} | --no-wal) [--no-latency] [--codec none|ouch|fix|sbe]"
                 );
                 std::process::exit(0);
             }
@@ -285,7 +296,8 @@ fn parse_args() -> (
 }
 
 fn main() {
-    let (tape, synth_n, slab, warmup, wal_on, latency, codec) = parse_args();
+    let (tape, synth_n, slab, warmup, wal_flags, latency, codec) = parse_args();
+    let wal_on = wal_flags.is_some();
     let ops = if let Some(n) = synth_n {
         synthetic(n)
     } else if let Some(p) = tape {
@@ -311,24 +323,35 @@ fn main() {
         codec_name
     );
 
-    let wal_path = std::env::temp_dir().join(format!("me-tape-{}.wal", std::process::id()));
-    let wal_bytes = if wal_on {
-        ((ops.len() + 2) * 64).next_multiple_of(4096).max(64 * 1024)
-    } else {
-        64 * 1024
+    let scratch = std::env::temp_dir().join(format!("me-tape-{}", std::process::id()));
+    let wal = match wal_flags {
+        Some(flags) => flags.build().unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }),
+        None => {
+            // NOTE: with --no-wal the engine still opens a log; it is never written.
+            std::fs::create_dir_all(&scratch).expect("scratch wal dir");
+            WalConfig {
+                dir: scratch.clone(),
+                epoch: 1,
+                segment_bytes: HEADER + FRAME,
+                spares: 1,
+                reserve_bytes: HEADER + FRAME,
+                preallocate: false,
+                prefault: false,
+                retire_queue: 4,
+                seal_sync: false,
+                preparer_poll_us: 100,
+                preparer_cpu: None,
+            }
+        }
     };
     let cmds = Arc::new(Spsc::new(16));
     let private = Arc::new(Spsc::new(1 << 16));
     let public = Arc::new(Spsc::new(1 << 16));
-    let mut eng = MatchingEngine::with_wal_size(
-        cmds,
-        private.clone(),
-        public.clone(),
-        &wal_path,
-        slab,
-        wal_bytes,
-    )
-    .expect("engine");
+    let mut eng =
+        MatchingEngine::new(cmds, private.clone(), public.clone(), &wal, slab).expect("engine");
     eng.set_wal(wal_on);
 
     match codec {
@@ -340,7 +363,7 @@ fn main() {
         Codec::Sbe => run_sbe(&ops, warmup, latency, &mut eng, &private, &public),
     }
 
-    let _ = std::fs::remove_file(wal_path);
+    let _ = std::fs::remove_dir_all(scratch);
 }
 
 fn report(n: usize, dt: f64, samples: &[u32]) {
