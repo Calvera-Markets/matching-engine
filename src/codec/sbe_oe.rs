@@ -181,7 +181,7 @@ impl OrderEntry for SbeOe {
                 ExecType::Trade,
                 OrdStatus::PartialFill,
             ),
-            EventType::BookReset => return 0,
+            EventType::BookReset | EventType::BalanceAck | EventType::BalanceChanged => return 0,
         };
         let mut enc = ExecutionReportEncoder::wrap(out, 0);
         enc.set_user_ref(user_ref);
@@ -208,7 +208,27 @@ mod tests {
     use crate::codec::sbe::order_entry::{
         ExecutionReportDecoder, NewOrderSingleEncoder, OrderCancelRequestEncoder,
     };
-    use crate::types::EventOrder;
+    use crate::types::{Event, EventBalanceAck, EventBalanceChanged, EventOrder};
+
+    fn balance_ack() -> Event {
+        Event::balance_ack(EventBalanceAck {
+            channel: 1,
+            seq: 2,
+            engine_seq: 3,
+            kind: 0,
+            reason: 0,
+        })
+    }
+
+    fn balance_changed() -> Event {
+        Event::balance_changed(EventBalanceChanged {
+            account: 9,
+            asset: 1,
+            balance: 50,
+            locked: 10,
+            engine_seq: 4,
+        })
+    }
 
     fn take_cmd(outcome: ParseOutcome) -> Option<Command> {
         match outcome {
@@ -438,6 +458,12 @@ mod tests {
         assert_eq!(decoded.side(), SbeSide::Sell);
 
         assert_eq!(oe.encode_event(&Event::reset(), &mut out), 0);
+        for evt in [balance_ack(), balance_changed()] {
+            assert_eq!(oe.encode_event(&evt, &mut out), 0);
+            let mut on_session = evt;
+            on_session.client_fd = 1;
+            assert_eq!(oe.encode_event(&on_session, &mut out), 0);
+        }
         let mut hidden = cancelled;
         hidden.client_fd = -1;
         assert_eq!(oe.encode_event(&hidden, &mut out), 0);

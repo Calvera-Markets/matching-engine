@@ -103,8 +103,8 @@ dependencies = [
 
 [[package]]
 name = "calvera-books"
-version = "0.1.1"
-source = "git+https://github.com/Calvera-Markets/orderbook.git?branch=feat%2F041-check-at-match#cb7482fe7489375e0feface9f0732f7007194575"
+version = "0.2.0"
+source = "git+https://github.com/Calvera-Markets/orderbook.git?tag=v0.2.0#dc2641e0dd46d71abb01b6e8776cf85140aee477"
 dependencies = [
  "libc",
 ]

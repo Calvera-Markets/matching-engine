@@ -229,7 +229,7 @@ impl Inner {
                     out,
                 )
             }
-            EventType::BookReset => 0,
+            EventType::BookReset | EventType::BalanceAck | EventType::BalanceChanged => 0,
         }
     }
 
@@ -614,7 +614,9 @@ impl OrderEntry for Fix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Event, EventOrder, EventReject, EventTrade, EventType};
+    use crate::types::{
+        Event, EventBalanceAck, EventBalanceChanged, EventOrder, EventReject, EventTrade, EventType,
+    };
     use ironfix_tagvalue::Encoder;
 
     const SID: SessionId = SessionId(1);
@@ -642,6 +644,26 @@ mod tests {
 
     fn parse_on(fix: &mut Fix, buf: &[u8], reply: &mut [u8]) -> ParseOutcome {
         fix.parse(buf, SID, reply)
+    }
+
+    fn balance_ack() -> Event {
+        Event::balance_ack(EventBalanceAck {
+            channel: 1,
+            seq: 2,
+            engine_seq: 3,
+            kind: 0,
+            reason: 0,
+        })
+    }
+
+    fn balance_changed() -> Event {
+        Event::balance_changed(EventBalanceChanged {
+            account: 9,
+            asset: 1,
+            balance: 50,
+            locked: 10,
+            engine_seq: 4,
+        })
     }
 
     fn command(outcome: ParseOutcome) -> Option<Command> {
@@ -1231,5 +1253,11 @@ mod tests {
         let mut reset = Event::reset();
         reset.client_fd = SID.0;
         assert_eq!(fix.encode_event(&reset, &mut reply), 0);
+        for evt in [balance_ack(), balance_changed()] {
+            assert_eq!(fix.encode_event(&evt, &mut reply), 0);
+            let mut on_session = evt;
+            on_session.client_fd = SID.0;
+            assert_eq!(fix.encode_event(&on_session, &mut reply), 0);
+        }
     }
 }
